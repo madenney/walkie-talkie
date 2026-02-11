@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from ..config import Settings
 
 if TYPE_CHECKING:
     from ..claude.tool_executor import ToolExecutor
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,3 +79,75 @@ class Session:
         self.interrupted = True
         if self.response_task and not self.response_task.done():
             self.response_task.cancel()
+
+    def estimate_tokens(self) -> int:
+        """Rough token estimate for conversation history (~4 chars per token)."""
+        total_chars = 0
+        for msg in self.conversation:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        total_chars += len(block.get("text", ""))
+                        total_chars += len(block.get("content", ""))
+        return total_chars // 4
+
+    def _trim_history(self) -> None:
+        """Keep conversation within configured turn limit and token budget."""
+        max_turns = self.settings.claude.max_conversation_turns
+        max_messages = max_turns * 2
+
+        # Trim by turn count
+        if len(self.conversation) > max_messages:
+            excess = len(self.conversation) - max_messages
+            self.conversation = self.conversation[excess:]
+
+        # Trim by estimated tokens (keep under ~100k tokens)
+        max_tokens = 100_000
+        while len(self.conversation) > 2 and self.estimate_tokens() > max_tokens:
+            # Drop oldest pair (user + assistant)
+            self.conversation = self.conversation[2:]
+
+
+class SessionRegistry:
+    """Tracks active sessions for monitoring and cleanup."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, Session] = {}
+
+    def add(self, session: Session) -> None:
+        self._sessions[session.session_id] = session
+
+    def remove(self, session_id: str) -> None:
+        session = self._sessions.pop(session_id, None)
+        if session:
+            session.cancel_response()
+            session.conversation.clear()
+            session.clear_audio_buffer()
+
+    def get(self, session_id: str) -> Session | None:
+        return self._sessions.get(session_id)
+
+    def clear(self) -> None:
+        for sid in list(self._sessions):
+            self.remove(sid)
+
+    def __len__(self) -> int:
+        return len(self._sessions)
+
+    def start_cleanup(self, interval: int = 300, max_idle: int = 1800) -> asyncio.Task:
+        """Periodically remove sessions idle for longer than max_idle seconds."""
+        async def _cleanup_loop():
+            while True:
+                await asyncio.sleep(interval)
+                now = time.time()
+                stale = [
+                    sid for sid, s in self._sessions.items()
+                    if now - s.last_activity > max_idle
+                ]
+                for sid in stale:
+                    log.info("Reaping stale session %s", sid)
+                    self.remove(sid)
+        return asyncio.create_task(_cleanup_loop())

@@ -47,6 +47,7 @@ class WsClient(
     }
 
     private fun doConnect(url: String) {
+        if (_connectionState.value) return
         webSocket?.cancel()
         connectAttempt++
         _events.tryEmit(WsEvent.Connecting(connectAttempt, url))
@@ -54,6 +55,9 @@ class WsClient(
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.i(TAG, "Connected to $url")
+                connectAttempt = 0
+                reconnectJob?.cancel()
+                reconnectJob = null
                 _connectionState.value = true
                 _events.tryEmit(WsEvent.Connected)
             }

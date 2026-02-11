@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -11,7 +12,7 @@ from .claude.client import ClaudeClient
 from .claude.tool_executor import ToolExecutor
 from .utils.safety import PathSandbox
 from .ws.handler import ConnectionHandler
-from .ws.session import Session
+from .ws.session import Session, SessionRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +66,18 @@ else:
     log.warning("No OpenAI API key — TTS disabled")
 
 
-app = FastAPI(title="Walkie Talkie", version="0.1.0")
+sessions = SessionRegistry()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_task = sessions.start_cleanup()
+    yield
+    cleanup_task.cancel()
+    sessions.clear()
+
+
+app = FastAPI(title="Walkie Talkie", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -74,6 +86,7 @@ async def health():
         "status": "ok",
         "stt": stt_engine is not None,
         "tts": tts_engine is not None,
+        "active_sessions": len(sessions),
     }
 
 
@@ -81,6 +94,7 @@ async def health():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     session = Session(settings=settings)
+    sessions.add(session)
     handler = ConnectionHandler(
         ws=ws,
         session=session,
@@ -94,7 +108,11 @@ async def websocket_endpoint(ws: WebSocket):
         },
     )
     log.info("New connection: session %s", session.session_id)
-    await handler.handle()
+    try:
+        await handler.handle()
+    finally:
+        sessions.remove(session.session_id)
+        log.info("Session %s removed from registry", session.session_id)
 
 
 def main():

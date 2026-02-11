@@ -17,6 +17,13 @@ android/.idea/
 # Environment
 .env
 
+# Server runtime
+server/server.log
+server/.server.pid
+
+# Config (contains personal paths — use config.example.yaml as template)
+server/config.yaml
+
 # Claude Code
 .claude/
 

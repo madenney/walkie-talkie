@@ -154,32 +154,39 @@ class ToolExecutor:
         except re.error as e:
             return {"success": False, "output": f"Invalid regex: {e}"}
 
-        results = []
         max_results = 200
+        root = self.sandbox.root
 
-        def _search_file(fpath: Path) -> list[str]:
-            hits = []
-            try:
-                text = fpath.read_text(errors="replace")
-                for i, line in enumerate(text.splitlines(), 1):
-                    if regex.search(line):
-                        rel = str(fpath.relative_to(self.sandbox.root))
-                        hits.append(f"{rel}:{i}: {line}")
-            except (OSError, UnicodeDecodeError):
-                pass
-            return hits
+        def _search_sync() -> list[str]:
+            results = []
 
-        if search_path.is_file():
-            results = _search_file(search_path)
-        else:
-            glob_pat = include or "**/*"
-            for fpath in search_path.glob(glob_pat):
-                if fpath.is_file() and not any(
-                    part.startswith(".") for part in fpath.parts
-                ):
-                    results.extend(_search_file(fpath))
-                    if len(results) >= max_results:
-                        break
+            def _search_file(fpath: Path) -> list[str]:
+                hits = []
+                try:
+                    text = fpath.read_text(errors="replace")
+                    for i, line in enumerate(text.splitlines(), 1):
+                        if regex.search(line):
+                            rel = str(fpath.relative_to(root))
+                            hits.append(f"{rel}:{i}: {line}")
+                except (OSError, UnicodeDecodeError):
+                    pass
+                return hits
+
+            if search_path.is_file():
+                results = _search_file(search_path)
+            else:
+                glob_pat = include or "**/*"
+                for fpath in search_path.glob(glob_pat):
+                    if fpath.is_file() and not any(
+                        part.startswith(".") for part in fpath.parts
+                    ):
+                        results.extend(_search_file(fpath))
+                        if len(results) >= max_results:
+                            break
+            return results
+
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, _search_sync)
 
         if not results:
             return {"success": True, "output": "No matches found"}

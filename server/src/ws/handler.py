@@ -26,6 +26,8 @@ from .protocol import (
     ResponseEnd,
     SelectWorkspace,
     TextMessage,
+    ToolResult,
+    ToolUse,
     Transcription,
     TTSEnd,
     TTSStart,
@@ -179,12 +181,12 @@ class ConnectionHandler:
 
     async def _run_claude_response(self) -> None:
         """Stream Claude response back to client, handling tool use."""
-        full_text = ""
-        # Buffer for detecting complete <speak>...</speak> blocks
+        # Separate buffer for detecting <speak> tags — consumed as tags are found,
+        # so it stays small and doesn't re-scan old text.
+        tts_buffer = ""
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
         tts_task: asyncio.Task | None = None
 
-        # Start TTS consumer if we have a TTS engine
         if self.tts:
             tts_task = asyncio.create_task(self._tts_consumer(tts_queue))
 
@@ -195,29 +197,30 @@ class ConnectionHandler:
                 break
 
             if event["type"] == "text_delta":
-                full_text += event["text"]
+                delta = event["text"]
+
                 # Strip <speak> tags for display, keep content
-                display_text = event["text"].replace("<speak>", "").replace("</speak>", "")
+                display_text = delta.replace("<speak>", "").replace("</speak>", "")
                 if display_text:
                     await self.send_json(ResponseDelta(text=display_text))
 
-                # Check for completed <speak> blocks to send to TTS immediately
+                # Accumulate into TTS buffer and extract completed <speak> blocks
                 if self.tts:
+                    tts_buffer += delta
                     while True:
-                        match = re.search(r"<speak>(.*?)</speak>", full_text, re.DOTALL)
+                        match = re.search(r"<speak>(.*?)</speak>", tts_buffer, re.DOTALL)
                         if not match:
                             break
                         speak_text = match.group(1).strip()
                         if speak_text:
                             await tts_queue.put(speak_text)
-                        # Remove the matched block so we don't match it again
-                        full_text = full_text[:match.start()] + match.group(1) + full_text[match.end():]
+                        # Consume everything up to and including the matched tag
+                        tts_buffer = tts_buffer[match.end():]
 
             elif event["type"] == "text_done":
                 pass
 
             elif event["type"] == "tool_use":
-                from .protocol import ToolUse
                 await self.send_json(ToolUse(
                     tool_name=event["tool_name"],
                     tool_id=event["tool_id"],
@@ -225,7 +228,6 @@ class ConnectionHandler:
                 ))
 
             elif event["type"] == "tool_result":
-                from .protocol import ToolResult
                 await self.send_json(ToolResult(
                     tool_id=event["tool_id"],
                     tool_name=event["tool_name"],
@@ -238,7 +240,6 @@ class ConnectionHandler:
 
         await self.send_json(ResponseEnd())
 
-        # Signal TTS consumer to finish and wait for it
         if tts_task:
             await tts_queue.put(None)
             await tts_task
