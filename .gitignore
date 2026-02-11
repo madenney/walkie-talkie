@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+
+# Environment
+.env
+
+# Claude Code
+.claude/
+
+# Sandbox contents (keep dir)
+claude_sandbox/*
+!claude_sandbox/.gitkeep

@@ -1,0 +1,35 @@
+[project]
+name = "walkie-talkie-server"
+version = "0.1.0"
+description = "Voice interface server for Claude"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "websockets>=14.0",
+    "anthropic>=0.43",
+    "faster-whisper>=1.1",
+    "openai>=1.60",
+    "numpy>=1.26",
+    "pydantic-settings>=2.7",
+    "pyyaml>=6.0",
+    "silero-vad>=5.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
