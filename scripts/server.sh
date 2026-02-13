@@ -10,11 +10,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Source .env if present
+# Source .env if present (won't overwrite existing env vars)
 if [[ -f "$PROJECT_ROOT/.env" ]]; then
-    set -a
-    source "$PROJECT_ROOT/.env"
-    set +a
+    while IFS='=' read -r key value; do
+        # Skip comments and empty lines
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+        # Only set if not already in environment
+        if [[ -z "${!key:-}" ]]; then
+            export "$key=$value"
+        fi
+    done < "$PROJECT_ROOT/.env"
 fi
 SERVER_DIR="$PROJECT_ROOT/server"
 PID_FILE="$SERVER_DIR/.server.pid"

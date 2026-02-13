@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import glob as glob_module
+import json
 import logging
 import os
 import re
+import urllib.parse
 from pathlib import Path
 
 from ..utils.safety import PathSandbox, check_command_safety
@@ -15,6 +17,11 @@ log = logging.getLogger(__name__)
 
 # Max output size to return to Claude (chars)
 MAX_OUTPUT = 50_000
+
+# Default headers for outgoing HTTP requests (many servers reject bare aiohttp UA)
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; WalkieTalkie/1.0)",
+}
 
 
 class ToolExecutor:
@@ -214,3 +221,75 @@ class ToolExecutor:
             entries.append(f"{item.name}{suffix}")
 
         return {"success": True, "output": "\n".join(entries) if entries else "(empty directory)"}
+
+    async def _tool_web_fetch(self, inp: dict) -> dict:
+        import aiohttp
+        url = inp["url"]
+        try:
+            async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.content_type and "html" in resp.content_type:
+                        html = await resp.text()
+                        text = self._html_to_text(html)
+                    else:
+                        text = await resp.text()
+                    if len(text) > MAX_OUTPUT:
+                        text = text[:MAX_OUTPUT] + "\n... (truncated)"
+                    return {"success": True, "output": text}
+        except Exception as e:
+            return {"success": False, "output": f"Fetch failed: {e}"}
+
+    async def _tool_web_search(self, inp: dict) -> dict:
+        import aiohttp
+        query = inp["query"]
+        # Use DuckDuckGo HTML lite (no API key needed)
+        url = "https://lite.duckduckgo.com/lite/"
+        try:
+            async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+                async with session.post(
+                    url,
+                    data={"q": query},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    html = await resp.text()
+                    text = self._html_to_text(html)
+                    if len(text) > MAX_OUTPUT:
+                        text = text[:MAX_OUTPUT] + "\n... (truncated)"
+                    return {"success": True, "output": text}
+        except Exception as e:
+            return {"success": False, "output": f"Search failed: {e}"}
+
+    async def _tool_download_file(self, inp: dict) -> dict:
+        import aiohttp
+        url = inp["url"]
+        path = self.sandbox.resolve(inp["path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            async with aiohttp.ClientSession(headers=_HTTP_HEADERS) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status != 200:
+                        return {"success": False, "output": f"HTTP {resp.status}"}
+                    data = await resp.read()
+                    path.write_bytes(data)
+                    return {"success": True, "output": f"Downloaded {len(data)} bytes to {inp['path']}"}
+        except Exception as e:
+            return {"success": False, "output": f"Download failed: {e}"}
+
+    @staticmethod
+    def _html_to_text(html: str) -> str:
+        """Quick and dirty HTML to text conversion."""
+        import re as _re
+        # Remove script/style blocks
+        text = _re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=_re.DOTALL | _re.IGNORECASE)
+        # Convert br/p/div to newlines
+        text = _re.sub(r"<br\s*/?>", "\n", text, flags=_re.IGNORECASE)
+        text = _re.sub(r"</(p|div|h[1-6]|li|tr)>", "\n", text, flags=_re.IGNORECASE)
+        # Strip remaining tags
+        text = _re.sub(r"<[^>]+>", "", text)
+        # Decode common entities
+        import html as _html
+        text = _html.unescape(text)
+        # Collapse whitespace
+        lines = [line.strip() for line in text.splitlines()]
+        text = "\n".join(line for line in lines if line)
+        return text

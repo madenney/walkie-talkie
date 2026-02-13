@@ -108,7 +108,11 @@ def load_settings(config_path: str | None = None) -> Settings:
         if projws_file.exists():
             with open(projws_file) as f:
                 projws = json.load(f)
-            for key, proj in projws.get("projects", {}).items():
+            # Support both top-level and nested {"projects": {...}} formats
+            projects = projws.get("projects", projws) if isinstance(projws.get("projects", None), dict) else projws
+            for key, proj in projects.items():
+                if not isinstance(proj, dict):
+                    continue
                 cwd = proj.get("cwd")
                 if cwd:
                     settings.workspaces.append(WorkspaceConfig(

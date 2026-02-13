@@ -76,6 +76,20 @@ fun SettingsScreen(
                 color = if (uiState.isConnected) MaterialTheme.colorScheme.primary
                 else MaterialTheme.colorScheme.error,
             )
+
+            Button(
+                onClick = {
+                    if (uiState.isConnected) viewModel.disconnect()
+                    else viewModel.connect()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (uiState.isConnected) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.primary,
+                ),
+            ) {
+                Text(if (uiState.isConnected) "Disconnect" else "Connect")
+            }
         }
     }
 }

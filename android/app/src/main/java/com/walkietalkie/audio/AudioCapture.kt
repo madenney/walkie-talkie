@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import kotlinx.coroutines.*
@@ -14,17 +16,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.sqrt
 
 private const val TAG = "AudioCapture"
-private const val SAMPLE_RATE = 16000
+const val SAMPLE_RATE = 16000
 private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
 private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-
-// RMS threshold for energy-based pre-filter (avoid streaming silence)
-private const val SILENCE_RMS_THRESHOLD = 200
 
 class AudioCapture(private val context: Context) {
 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
 
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording
@@ -33,10 +34,10 @@ class AudioCapture(private val context: Context) {
         .coerceAtLeast(SAMPLE_RATE * 2) // at least 1 second buffer
 
     /**
-     * Start capturing audio. Calls [onAudioChunk] with PCM s16le byte arrays.
-     * Chunks below the silence threshold are not emitted.
+     * Start capturing audio. Calls [onAudioChunk] with every PCM chunk and its RMS value.
+     * The caller is responsible for deciding what to do with silence vs speech.
      */
-    fun start(scope: CoroutineScope, onAudioChunk: (ByteArray) -> Unit) {
+    fun start(scope: CoroutineScope, onAudioChunk: (pcmBytes: ByteArray, rms: Double) -> Unit) {
         if (_isRecording.value) return
 
         if (ActivityCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
@@ -64,17 +65,40 @@ class AudioCapture(private val context: Context) {
         record.startRecording()
         _isRecording.value = true
 
+        // Enable hardware echo cancellation (removes speaker output from mic input)
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                echoCanceler = AcousticEchoCanceler.create(record.audioSessionId)?.apply {
+                    setEnabled(true)
+                    Log.i(TAG, "AcousticEchoCanceler enabled")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "AEC unavailable", e)
+        }
+
+        // Enable hardware noise suppression (filters ambient noise)
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)?.apply {
+                    setEnabled(true)
+                    Log.i(TAG, "NoiseSuppressor enabled")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "NoiseSuppressor unavailable", e)
+        }
+
         captureJob = scope.launch(Dispatchers.IO) {
-            val buffer = ShortArray(bufferSize / 2) // 16-bit samples
+            // Read in ~100ms chunks for responsive VAD, regardless of internal buffer size
+            val chunkSamples = SAMPLE_RATE / 10  // 1600 samples = 100ms
+            val buffer = ShortArray(chunkSamples)
             while (isActive && _isRecording.value) {
                 val read = record.read(buffer, 0, buffer.size)
                 if (read > 0) {
-                    // Energy-based pre-filter
                     val rms = computeRms(buffer, read)
-                    if (rms > SILENCE_RMS_THRESHOLD) {
-                        val bytes = shortsToBytes(buffer, read)
-                        onAudioChunk(bytes)
-                    }
+                    val bytes = shortsToBytes(buffer, read)
+                    onAudioChunk(bytes, rms)
                 }
             }
         }
@@ -86,19 +110,25 @@ class AudioCapture(private val context: Context) {
         _isRecording.value = false
         captureJob?.cancel()
         captureJob = null
+        echoCanceler?.release()
+        echoCanceler = null
+        noiseSuppressor?.release()
+        noiseSuppressor = null
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
         Log.i(TAG, "Recording stopped")
     }
 
-    private fun computeRms(samples: ShortArray, count: Int): Double {
-        var sum = 0.0
-        for (i in 0 until count) {
-            val s = samples[i].toDouble()
-            sum += s * s
+    companion object {
+        fun computeRms(samples: ShortArray, count: Int): Double {
+            var sum = 0.0
+            for (i in 0 until count) {
+                val s = samples[i].toDouble()
+                sum += s * s
+            }
+            return sqrt(sum / count)
         }
-        return sqrt(sum / count)
     }
 
     private fun shortsToBytes(shorts: ShortArray, count: Int): ByteArray {

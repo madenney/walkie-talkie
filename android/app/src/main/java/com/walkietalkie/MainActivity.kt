@@ -18,6 +18,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.walkietalkie.service.WalkieTalkieService
+import com.walkietalkie.ui.screens.AmbientScreen
 import com.walkietalkie.ui.screens.ChatScreen
 import com.walkietalkie.ui.screens.SettingsScreen
 import com.walkietalkie.ui.viewmodel.ChatViewModel
@@ -60,7 +61,10 @@ class MainActivity : ComponentActivity() {
                                 viewModel = chatViewModel,
                                 onNavigateToSettings = {
                                     navController.navigate("settings")
-                                }
+                                },
+                                onNavigateToAmbient = {
+                                    navController.navigate("ambient")
+                                },
                             )
                         }
                         composable("settings") {
@@ -69,6 +73,14 @@ class MainActivity : ComponentActivity() {
                                 onNavigateBack = {
                                     navController.popBackStack()
                                 }
+                            )
+                        }
+                        composable("ambient") {
+                            AmbientScreen(
+                                viewModel = chatViewModel,
+                                onExit = {
+                                    navController.popBackStack()
+                                },
                             )
                         }
                     }

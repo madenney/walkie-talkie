@@ -181,9 +181,12 @@ class ConnectionHandler:
 
     async def _run_claude_response(self) -> None:
         """Stream Claude response back to client, handling tool use."""
-        # Separate buffer for detecting <speak> tags — consumed as tags are found,
-        # so it stays small and doesn't re-scan old text.
+        # Incremental TTS extraction: queue text as soon as possible
+        # instead of waiting for complete <speak>...</speak> blocks.
         tts_buffer = ""
+        in_speak = False
+        speak_accum = ""
+        first_word_sent = False
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
         tts_task: asyncio.Task | None = None
 
@@ -204,18 +207,68 @@ class ConnectionHandler:
                 if display_text:
                     await self.send_json(ResponseDelta(text=display_text))
 
-                # Accumulate into TTS buffer and extract completed <speak> blocks
+                # Incrementally extract text from <speak> blocks for TTS
                 if self.tts:
                     tts_buffer += delta
                     while True:
-                        match = re.search(r"<speak>(.*?)</speak>", tts_buffer, re.DOTALL)
-                        if not match:
-                            break
-                        speak_text = match.group(1).strip()
-                        if speak_text:
-                            await tts_queue.put(speak_text)
-                        # Consume everything up to and including the matched tag
-                        tts_buffer = tts_buffer[match.end():]
+                        if not in_speak:
+                            idx = tts_buffer.find("<speak>")
+                            if idx == -1:
+                                # Keep potential partial <speak> tag at end
+                                lt = tts_buffer.rfind("<")
+                                if lt != -1 and lt >= len(tts_buffer) - 6:
+                                    tts_buffer = tts_buffer[lt:]
+                                else:
+                                    tts_buffer = ""
+                                break
+                            # Enter speak mode
+                            in_speak = True
+                            first_word_sent = False
+                            speak_accum = ""
+                            tts_buffer = tts_buffer[idx + 7:]
+                            # Fall through to process content
+
+                        # Inside <speak> block
+                        close_idx = tts_buffer.find("</speak>")
+                        if close_idx != -1:
+                            # Flush remaining text and exit speak mode
+                            speak_accum += tts_buffer[:close_idx]
+                            remaining = speak_accum.strip()
+                            if remaining:
+                                await tts_queue.put(remaining)
+                            in_speak = False
+                            speak_accum = ""
+                            tts_buffer = tts_buffer[close_idx + 8:]
+                            continue  # Check for more <speak> blocks
+
+                        # No close tag yet — accumulate, keeping potential partial </speak>
+                        lt = tts_buffer.rfind("<")
+                        if lt != -1 and lt >= len(tts_buffer) - 7:
+                            speak_accum += tts_buffer[:lt]
+                            tts_buffer = tts_buffer[lt:]
+                        else:
+                            speak_accum += tts_buffer
+                            tts_buffer = ""
+
+                        # Queue text incrementally
+                        if not first_word_sent:
+                            # Queue first word ASAP to minimize time-to-first-audio
+                            m = re.match(r"\s*(\S+)\s", speak_accum)
+                            if m:
+                                await tts_queue.put(m.group(1))
+                                speak_accum = speak_accum[m.end():]
+                                first_word_sent = True
+                        else:
+                            # Queue complete sentences as they arrive
+                            while True:
+                                m = re.search(r"[.!?]\s", speak_accum)
+                                if not m:
+                                    break
+                                sentence = speak_accum[: m.end()].strip()
+                                if sentence:
+                                    await tts_queue.put(sentence)
+                                speak_accum = speak_accum[m.end() :]
+                        break  # Need more data from stream
 
             elif event["type"] == "text_done":
                 pass
@@ -247,27 +300,31 @@ class ConnectionHandler:
     async def _tts_consumer(self, queue: asyncio.Queue[str | None]) -> None:
         """Consume speak text from the queue and stream TTS audio."""
         started = False
-        while True:
-            text = await queue.get()
-            if text is None:
-                break
-            if self.session.interrupted:
-                continue
+        try:
+            while True:
+                text = await queue.get()
+                if text is None:
+                    break
+                if self.session.interrupted:
+                    continue
 
-            if not started:
-                await self.send_json(TTSStart())
-                started = True
+                if not started:
+                    await self.send_json(TTSStart())
+                    started = True
 
-            try:
-                async for chunk in self.tts.synthesize(text):
-                    if self.session.interrupted:
-                        break
-                    await self.send_audio(chunk)
-            except Exception:
-                log.exception("TTS error")
+                try:
+                    async for chunk in self.tts.synthesize(text):
+                        if self.session.interrupted:
+                            break
+                        await self.send_audio(chunk)
+                except Exception:
+                    log.exception("TTS error")
+                    break
 
-        if started:
-            await self.send_json(TTSEnd())
+            if started:
+                await self.send_json(TTSEnd())
+        except (WebSocketDisconnect, RuntimeError):
+            log.debug("TTS consumer: client disconnected")
 
     async def _handle_select_workspace(self, name: str) -> None:
         """Switch to a workspace: create sandbox + executor, clear conversation."""

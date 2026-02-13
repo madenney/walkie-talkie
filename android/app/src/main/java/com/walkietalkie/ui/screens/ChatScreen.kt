@@ -3,12 +3,15 @@ package com.walkietalkie.ui.screens
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
@@ -16,7 +19,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
+import com.walkietalkie.audio.VadState
 import com.walkietalkie.ui.components.MessageBubble
 import com.walkietalkie.ui.components.RecordButton
 import com.walkietalkie.ui.viewmodel.ChatPage
@@ -28,6 +33,7 @@ import com.walkietalkie.ui.viewmodel.Workspace
 fun ChatScreen(
     viewModel: ChatViewModel,
     onNavigateToSettings: () -> Unit,
+    onNavigateToAmbient: () -> Unit = {},
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val pagerState = rememberPagerState(pageCount = { uiState.pages.size })
@@ -48,6 +54,7 @@ fun ChatScreen(
             uiState = uiState,
             viewModel = viewModel,
             onNavigateToSettings = onNavigateToSettings,
+            onNavigateToAmbient = onNavigateToAmbient,
         )
     }
 }
@@ -59,6 +66,7 @@ private fun ChatPageContent(
     uiState: ChatUiState,
     viewModel: ChatViewModel,
     onNavigateToSettings: () -> Unit,
+    onNavigateToAmbient: () -> Unit,
 ) {
     var textInput by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -92,6 +100,11 @@ private fun ChatPageContent(
                     }
                 },
                 actions = {
+                    // Ambient mode
+                    IconButton(onClick = onNavigateToAmbient) {
+                        Icon(Icons.Default.FiberManualRecord, contentDescription = "Ambient mode")
+                    }
+
                     // Connection indicator
                     ConnectionIndicator(uiState.isConnected)
 
@@ -122,11 +135,11 @@ private fun ChatPageContent(
                     textInput = ""
                 },
                 isConnected = uiState.isConnected,
-                isRecording = uiState.isRecording,
+                isMuted = uiState.isMuted,
+                listeningState = uiState.listeningState,
+                isPlayingAudio = uiState.isPlayingAudio,
                 isResponding = page.isResponding,
-                onStartRecording = { viewModel.startRecording() },
-                onStopRecording = { viewModel.stopRecording() },
-                onInterrupt = { viewModel.interrupt() },
+                onToggleMute = { viewModel.toggleMute() },
                 onPickImage = { imagePicker.launch("image/*") },
             )
         }
@@ -212,68 +225,150 @@ private fun BottomInputBar(
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     isConnected: Boolean,
-    isRecording: Boolean,
+    isMuted: Boolean,
+    listeningState: VadState,
+    isPlayingAudio: Boolean,
     isResponding: Boolean,
-    onStartRecording: () -> Unit,
-    onStopRecording: () -> Unit,
-    onInterrupt: () -> Unit,
+    onToggleMute: () -> Unit,
     onPickImage: () -> Unit,
 ) {
     Surface(
         shadowElevation = 8.dp,
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .navigationBarsPadding(),
         ) {
-            // Image picker button
-            IconButton(
-                onClick = onPickImage,
-                enabled = isConnected,
-            ) {
-                Icon(Icons.Default.Image, contentDescription = "Send image")
+            // Status indicator
+            if (isConnected && !isMuted) {
+                ListeningIndicator(
+                    listeningState = listeningState,
+                    isPlayingAudio = isPlayingAudio,
+                    isResponding = isResponding,
+                )
             }
 
-            // Text input
-            OutlinedTextField(
-                value = textInput,
-                onValueChange = onTextChange,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Message...") },
-                maxLines = 4,
-                enabled = isConnected,
-                trailingIcon = {
-                    if (textInput.isNotBlank()) {
-                        IconButton(onClick = onSend) {
-                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                // Image picker button
+                IconButton(
+                    onClick = onPickImage,
+                    enabled = isConnected,
+                ) {
+                    Icon(Icons.Default.Image, contentDescription = "Send image")
+                }
+
+                // Text input
+                OutlinedTextField(
+                    value = textInput,
+                    onValueChange = onTextChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message...") },
+                    maxLines = 4,
+                    enabled = isConnected,
+                    trailingIcon = {
+                        if (textInput.isNotBlank()) {
+                            IconButton(onClick = onSend) {
+                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                            }
                         }
                     }
-                }
-            )
+                )
 
-            Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(8.dp))
 
-            // Record / interrupt button
-            if (isResponding) {
-                IconButton(onClick = onInterrupt) {
-                    Icon(
-                        Icons.Default.StopCircle,
-                        contentDescription = "Stop",
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(40.dp)
-                    )
-                }
-            } else {
+                // Mute/unmute toggle (interrupt button removed — voice interrupts automatically)
                 RecordButton(
-                    isRecording = isRecording,
+                    isMuted = isMuted,
                     isEnabled = isConnected,
-                    onStartRecording = onStartRecording,
-                    onStopRecording = onStopRecording,
+                    listeningState = listeningState,
+                    isPlayingAudio = isPlayingAudio,
+                    onToggleMute = onToggleMute,
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun ListeningIndicator(
+    listeningState: VadState,
+    isPlayingAudio: Boolean,
+    isResponding: Boolean,
+) {
+    val isSpeech = listeningState == VadState.SPEECH || listeningState == VadState.COOLDOWN
+    val isListening = listeningState == VadState.LISTENING
+
+    val statusText: String
+    val statusColor: androidx.compose.ui.graphics.Color
+
+    when {
+        isSpeech -> {
+            statusText = "Hearing you..."
+            statusColor = MaterialTheme.colorScheme.error
+        }
+        isPlayingAudio -> {
+            statusText = "Speaking..."
+            statusColor = MaterialTheme.colorScheme.tertiary
+        }
+        isResponding -> {
+            statusText = "Thinking..."
+            statusColor = MaterialTheme.colorScheme.secondary
+        }
+        isListening -> {
+            statusText = "Listening..."
+            statusColor = MaterialTheme.colorScheme.primary
+        }
+        else -> return
+    }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "statusPulse")
+    val dotAlpha by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = if (isSpeech) 0.5f else 0.3f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(
+                durationMillis = if (isSpeech) 400 else 1000,
+                easing = EaseInOut,
+            ),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "dotAlpha",
+    )
+
+    val dotSize = if (isSpeech) 10.dp else 8.dp
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (isSpeech) {
+                    Modifier.background(statusColor.copy(alpha = 0.1f))
+                } else {
+                    Modifier
+                }
+            )
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(dotSize)
+                .clip(CircleShape)
+                .background(statusColor.copy(alpha = dotAlpha))
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = statusText,
+            style = if (isSpeech) MaterialTheme.typography.labelMedium
+                    else MaterialTheme.typography.labelSmall,
+            color = statusColor,
+        )
     }
 }

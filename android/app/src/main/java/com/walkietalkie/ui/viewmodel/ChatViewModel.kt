@@ -1,17 +1,31 @@
 package com.walkietalkie.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import android.util.Log
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.walkietalkie.BuildConfig
 import com.walkietalkie.audio.AudioCapture
 import com.walkietalkie.audio.AudioPlayer
+import com.walkietalkie.audio.VadState
+import com.walkietalkie.audio.VoiceActivityDetector
 import com.walkietalkie.camera.ImageCapture
 import com.walkietalkie.data.websocket.*
+import com.walkietalkie.service.WalkieTalkieService
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+
+private val Context.settingsStore by preferencesDataStore("settings")
+private val KEY_SERVER_URL = stringPreferencesKey("server_url")
+private val KEY_MUTED = booleanPreferencesKey("muted")
 
 private const val TAG = "ChatViewModel"
 
@@ -43,7 +57,8 @@ data class ChatUiState(
     val pages: List<ChatPage> = listOf(ChatPage()),
     val activePageIndex: Int = 0,
     val isConnected: Boolean = false,
-    val isRecording: Boolean = false,
+    val isMuted: Boolean = false,
+    val listeningState: VadState = VadState.IDLE,
     val isPlayingAudio: Boolean = false,
     val serverUrl: String = BuildConfig.DEFAULT_SERVER_URL,
     val workspaces: List<Workspace> = emptyList(),
@@ -55,6 +70,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val audioCapture = AudioCapture(application)
     val audioPlayer = AudioPlayer(application)
 
+    private lateinit var vad: VoiceActivityDetector
+    // Track whether we've sent AudioStart (to pair with AudioEnd)
+    private var audioSessionActive = false
+
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState
 
@@ -64,15 +83,46 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     init {
         audioPlayer.initialize()
 
-        // Auto-connect on launch
-        addSystemMessage("Starting up...")
-        connect()
+        vad = VoiceActivityDetector(
+            audioCapture = audioCapture,
+            // VAD callbacks fire on Dispatchers.IO (audio thread).
+            // ExoPlayer and UI state must be touched on Main, so dispatch.
+            onSpeechStart = { viewModelScope.launch { onVadSpeechStart() } },
+            onAudioChunk = { chunk -> onVadAudioChunk(chunk) },
+            onSpeechEnd = { viewModelScope.launch { onVadSpeechEnd() } },
+        )
+
+        // Load saved settings, then auto-connect
+        viewModelScope.launch {
+            getApplication<Application>().settingsStore.data.first().let { prefs ->
+                val saved = prefs[KEY_SERVER_URL]
+                if (!saved.isNullOrBlank()) {
+                    _uiState.update { it.copy(serverUrl = saved) }
+                }
+                val muted = prefs[KEY_MUTED] ?: false
+                _uiState.update { it.copy(isMuted = muted) }
+            }
+            if (isServerUrlConfigured()) {
+                addSystemMessage("Starting up...")
+                connect()
+            } else {
+                addSystemMessage("Set your server URL in Settings to get started.")
+            }
+        }
 
         viewModelScope.launch {
             wsClient.isConnected.collect { connected ->
+                val wasConnected = _uiState.value.isConnected
                 _uiState.update { it.copy(isConnected = connected) }
                 if (connected) {
                     addSystemMessage("Connected")
+                    // Auto-start listening on connect (if not muted)
+                    if (!_uiState.value.isMuted) {
+                        startListening()
+                    }
+                } else if (wasConnected) {
+                    // Disconnected — stop listening
+                    stopListening()
                 }
             }
         }
@@ -83,15 +133,48 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // Observe VAD state for UI
         viewModelScope.launch {
-            audioCapture.isRecording.collect { recording ->
-                _uiState.update { it.copy(isRecording = recording) }
+            vad.state.collect { vadState ->
+                _uiState.update { it.copy(listeningState = vadState) }
             }
         }
 
         viewModelScope.launch {
+            var unsuppressJob: Job? = null
             audioPlayer.isPlaying.collect { playing ->
                 _uiState.update { it.copy(isPlayingAudio = playing) }
+                unsuppressJob?.cancel()
+                if (playing) {
+                    // Suppress VAD while TTS is playing to prevent echo detection
+                    vad.suppressed = true
+                } else {
+                    // Delay before unsuppressing to avoid catching playback tail
+                    unsuppressJob = viewModelScope.launch {
+                        delay(500)
+                        vad.suppressed = false
+                    }
+                }
+            }
+        }
+
+        // Update foreground service notification with current status
+        viewModelScope.launch {
+            uiState.collect { state ->
+                val activePage = state.pages.getOrNull(state.activePageIndex)
+                val isSpeech = state.listeningState == VadState.SPEECH ||
+                        state.listeningState == VadState.COOLDOWN
+
+                val status = when {
+                    !state.isConnected -> "Disconnected"
+                    state.isMuted -> "Muted"
+                    state.isPlayingAudio -> "Speaking"
+                    activePage?.isResponding == true -> "Thinking..."
+                    isSpeech -> "Hearing you..."
+                    state.listeningState == VadState.LISTENING -> "Listening"
+                    else -> "Connected"
+                }
+                WalkieTalkieService.instance?.updateNotification(status)
             }
         }
     }
@@ -99,12 +182,75 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun connect(url: String? = null) {
         val serverUrl = url ?: _uiState.value.serverUrl
         _uiState.update { it.copy(serverUrl = serverUrl) }
+        if (!isServerUrlConfigured(serverUrl)) {
+            addSystemMessage("Set your server URL in Settings to get started.")
+            return
+        }
         wsClient.connect(serverUrl)
     }
 
+    private fun isServerUrlConfigured(url: String? = null): Boolean {
+        val u = url ?: _uiState.value.serverUrl
+        return u.isNotBlank() && !u.contains("your-server-ip")
+    }
+
     fun disconnect() {
+        stopListening()
         wsClient.disconnect()
         _uiState.update { it.copy(isConnected = false) }
+    }
+
+    fun toggleMute() {
+        val nowMuted = !_uiState.value.isMuted
+        _uiState.update { it.copy(isMuted = nowMuted) }
+
+        // Persist preference
+        viewModelScope.launch {
+            getApplication<Application>().settingsStore.edit { prefs ->
+                prefs[KEY_MUTED] = nowMuted
+            }
+        }
+
+        if (nowMuted) {
+            stopListening()
+        } else if (_uiState.value.isConnected) {
+            startListening()
+        }
+    }
+
+    private fun startListening() {
+        vad.startListening(viewModelScope)
+    }
+
+    private fun stopListening() {
+        val wasInSpeech = audioSessionActive
+        vad.stopListening()
+        if (wasInSpeech) {
+            wsClient.sendJson(AudioEndMsg())
+            audioSessionActive = false
+        }
+    }
+
+    private fun onVadSpeechStart() {
+        // If TTS is playing or server is responding, interrupt first
+        val state = _uiState.value
+        if (state.isPlayingAudio || state.pages[state.activePageIndex].isResponding) {
+            interrupt(sendInterruptMsg = true)
+        }
+
+        wsClient.sendJson(AudioStartMsg())
+        audioSessionActive = true
+    }
+
+    private fun onVadAudioChunk(chunk: ByteArray) {
+        wsClient.sendMicAudio(chunk)
+    }
+
+    private fun onVadSpeechEnd() {
+        if (audioSessionActive) {
+            wsClient.sendJson(AudioEndMsg())
+            audioSessionActive = false
+        }
     }
 
     fun sendText(text: String) {
@@ -119,21 +265,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         wsClient.sendJson(ImageMsg(data = encoded, text = text))
     }
 
-    fun startRecording() {
-        if (_uiState.value.isRecording) return
-        wsClient.sendJson(AudioStartMsg())
-        audioCapture.start(viewModelScope) { chunk ->
-            wsClient.sendMicAudio(chunk)
+    fun interrupt(sendInterruptMsg: Boolean = true) {
+        if (sendInterruptMsg) {
+            wsClient.sendJson(InterruptMsg())
         }
-    }
-
-    fun stopRecording() {
-        audioCapture.stop()
-        wsClient.sendJson(AudioEndMsg())
-    }
-
-    fun interrupt() {
-        wsClient.sendJson(InterruptMsg())
         audioPlayer.stop()
         updateActivePage { it.copy(isResponding = false) }
         streamingMessageId?.let { id ->
@@ -144,6 +279,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateServerUrl(url: String) {
         _uiState.update { it.copy(serverUrl = url) }
+        viewModelScope.launch {
+            getApplication<Application>().settingsStore.edit { prefs ->
+                prefs[KEY_SERVER_URL] = url
+            }
+        }
     }
 
     fun selectWorkspace(name: String) {
@@ -175,12 +315,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Cancel in-flight response on old page
         val oldPage = state.pages[state.activePageIndex]
         if (oldPage.isResponding) {
-            wsClient.sendJson(InterruptMsg())
-            audioPlayer.stop()
-            updatePage(state.activePageIndex) { it.copy(isResponding = false) }
-            streamingMessageId?.let { id ->
-                updatePageMessage(state.activePageIndex, id) { it.copy(isStreaming = false) }
-            }
+            interrupt()
         }
         streamingMessageId = null
 
@@ -337,8 +472,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        stopListening()
         wsClient.disconnect()
-        audioCapture.stop()
         audioPlayer.release()
         super.onCleared()
     }

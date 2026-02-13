@@ -137,4 +137,50 @@ TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "web_fetch",
+        "description": "Fetch the contents of a URL. Returns the page text (HTML converted to plain text). Use for reading web pages, docs, APIs, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL to fetch",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web and return results. Returns titles, URLs, and snippets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "download_file",
+        "description": "Download a file from a URL and save it to the workspace. Returns the saved file path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL to download from",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File path to save to (relative to workspace root)",
+                },
+            },
+            "required": ["url", "path"],
+        },
+    },
 ]
