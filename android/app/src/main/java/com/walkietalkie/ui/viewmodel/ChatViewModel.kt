@@ -399,6 +399,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             is ServerMessage.WorkspaceList -> {
                 val workspaces = msg.msg.workspaces.map { Workspace(it.name, it.path) }
                 _uiState.update { it.copy(workspaces = workspaces) }
+
+                // On app open, default the active page to the Sandbox workspace
+                // (fall back to the first listed) if nothing is selected yet.
+                val active = _uiState.value.run { pages.getOrNull(activePageIndex) }
+                if (active?.currentWorkspace == null && workspaces.isNotEmpty()) {
+                    val default = workspaces.firstOrNull { it.name.equals("Sandbox", ignoreCase = true) }
+                        ?: workspaces.first()
+                    selectWorkspace(default.name)
+                }
             }
 
             is ServerMessage.WorkspaceSelected -> {

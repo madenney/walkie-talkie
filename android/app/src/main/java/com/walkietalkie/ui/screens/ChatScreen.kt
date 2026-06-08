@@ -148,8 +148,9 @@ private fun ChatPageContent(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .imePadding(),
+                // `padding` already includes the bottom bar's height, which grows
+                // with the keyboard — no separate imePadding() needed here.
+                .padding(padding),
             contentPadding = PaddingValues(vertical = 8.dp),
         ) {
             items(page.messages, key = { it.id }) { message ->
@@ -238,7 +239,8 @@ private fun BottomInputBar(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding(),
+                // Sit above the keyboard when it's open, above the nav bar when it's not.
+                .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime)),
         ) {
             // Status indicator
             if (isConnected && !isMuted) {

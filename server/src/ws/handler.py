@@ -9,6 +9,7 @@ import re
 from typing import TYPE_CHECKING
 
 from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from ..config import WorkspaceConfig
 from ..claude.tool_executor import ToolExecutor
@@ -65,14 +66,45 @@ class ConnectionHandler:
         self.tts = tts_engine
         self.workspaces = {w.name: w for w in (workspaces or [])}
         self.safety_config = safety_config or {}
+        self._disconnected = False
+
+    @property
+    def connected(self) -> bool:
+        """True while the socket is still open and usable for sends."""
+        return (
+            not self._disconnected
+            and self.ws.application_state == WebSocketState.CONNECTED
+        )
 
     async def send_json(self, msg) -> None:
-        """Send a Pydantic model as JSON text frame."""
-        await self.ws.send_text(msg.model_dump_json())
+        """Send a Pydantic model as JSON text frame.
+
+        No-ops once the client has gone away. A disconnect mid-response also
+        marks the session interrupted so the streaming loop unwinds cleanly
+        instead of raising on every subsequent send.
+        """
+        if not self.connected:
+            return
+        try:
+            await self.ws.send_text(msg.model_dump_json())
+        except (WebSocketDisconnect, RuntimeError):
+            self._mark_disconnected()
 
     async def send_audio(self, data: bytes) -> None:
         """Send TTS audio as binary frame with prefix."""
-        await self.ws.send_bytes(bytes([AudioPrefix.TTS]) + data)
+        if not self.connected:
+            return
+        try:
+            await self.ws.send_bytes(bytes([AudioPrefix.TTS]) + data)
+        except (WebSocketDisconnect, RuntimeError):
+            self._mark_disconnected()
+
+    def _mark_disconnected(self) -> None:
+        """Record that the client is gone and stop any in-flight response."""
+        if not self._disconnected:
+            self._disconnected = True
+            log.info("Session %s client disconnected mid-send", self.session.session_id)
+        self.session.interrupted = True
 
     async def handle(self) -> None:
         """Main message loop."""
