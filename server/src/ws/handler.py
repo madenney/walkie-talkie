@@ -218,7 +218,7 @@ class ConnectionHandler:
         tts_buffer = ""
         in_speak = False
         speak_accum = ""
-        first_word_sent = False
+        first_chunk_sent = False
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
         tts_task: asyncio.Task | None = None
 
@@ -255,7 +255,7 @@ class ConnectionHandler:
                                 break
                             # Enter speak mode
                             in_speak = True
-                            first_word_sent = False
+                            first_chunk_sent = False
                             speak_accum = ""
                             tts_buffer = tts_buffer[idx + 7:]
                             # Fall through to process content
@@ -283,13 +283,17 @@ class ConnectionHandler:
                             tts_buffer = ""
 
                         # Queue text incrementally
-                        if not first_word_sent:
-                            # Queue first word ASAP to minimize time-to-first-audio
-                            m = re.match(r"\s*(\S+)\s", speak_accum)
+                        if not first_chunk_sent:
+                            # Queue the first natural phrase ASAP (up to the first
+                            # pause — comma, dash, or sentence end) to minimize
+                            # time-to-first-audio without sounding clipped.
+                            m = re.search(r"[,;:—.!?]\s", speak_accum)
                             if m:
-                                await tts_queue.put(m.group(1))
+                                phrase = speak_accum[: m.end()].strip()
+                                if phrase:
+                                    await tts_queue.put(phrase)
                                 speak_accum = speak_accum[m.end():]
-                                first_word_sent = True
+                                first_chunk_sent = True
                         else:
                             # Queue complete sentences as they arrive
                             while True:

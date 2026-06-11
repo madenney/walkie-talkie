@@ -59,6 +59,13 @@ fun AmbientScreen(
         }
     }
 
+    // Ambient is the hands-free VAD mode. The main screen no longer auto-listens,
+    // so start voice detection on entry and stop it when we leave.
+    DisposableEffect(Unit) {
+        viewModel.onEnterAmbient()
+        onDispose { viewModel.onExitAmbient() }
+    }
+
     // Gesture flash state
     var flashWhite by remember { mutableStateOf(false) }
 

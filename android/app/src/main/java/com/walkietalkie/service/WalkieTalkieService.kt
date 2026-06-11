@@ -43,6 +43,11 @@ class WalkieTalkieService : Service() {
     override fun onDestroy() {
         instance = null
         releaseWakeLock()
+        // Pull the notification down ourselves. Some OEMs (e.g. Samsung) leave the
+        // ongoing foreground-service notification posted after the service dies, so
+        // stopService alone isn't enough — explicitly remove it.
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
         Log.i(TAG, "Service destroyed")
         super.onDestroy()
     }
@@ -65,6 +70,11 @@ class WalkieTalkieService : Service() {
             .setContentTitle("Walkie Talkie")
             .setContentText(status)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            // Red accent => the launcher badge dot (and the notification itself)
+            // shows red while connected. Disconnected stops the service entirely,
+            // so the badge disappears.
+            .setColor(0xFFFF0000.toInt())
+            .setColorized(true)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()

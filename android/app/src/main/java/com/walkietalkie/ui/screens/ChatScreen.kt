@@ -20,10 +20,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
-import com.walkietalkie.audio.VadState
 import com.walkietalkie.ui.components.MessageBubble
-import com.walkietalkie.ui.components.RecordButton
+import com.walkietalkie.ui.components.PushToTalkButton
 import com.walkietalkie.ui.viewmodel.ChatPage
 import com.walkietalkie.ui.viewmodel.ChatUiState
 import com.walkietalkie.ui.viewmodel.ChatViewModel
@@ -70,6 +71,7 @@ private fun ChatPageContent(
 ) {
     var textInput by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val keyboardController = LocalSoftwareKeyboardController.current
 
     // Auto-scroll to bottom when new messages arrive
     LaunchedEffect(page.messages.size) {
@@ -105,20 +107,14 @@ private fun ChatPageContent(
                         Icon(Icons.Default.FiberManualRecord, contentDescription = "Ambient mode")
                     }
 
-                    // Connection indicator
-                    ConnectionIndicator(uiState.isConnected)
-
-                    IconButton(onClick = {
-                        if (uiState.isConnected) viewModel.disconnect()
-                        else viewModel.connect()
-                    }) {
-                        Icon(
-                            imageVector = if (uiState.isConnected) Icons.Default.LinkOff
-                            else Icons.Default.Link,
-                            contentDescription = if (uiState.isConnected) "Disconnect"
-                            else "Connect"
-                        )
-                    }
+                    // Connection indicator doubles as the connect/disconnect toggle.
+                    ConnectionIndicator(
+                        isConnected = uiState.isConnected,
+                        onClick = {
+                            if (uiState.isConnected) viewModel.disconnect()
+                            else viewModel.connect()
+                        },
+                    )
 
                     IconButton(onClick = onNavigateToSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
@@ -133,13 +129,14 @@ private fun ChatPageContent(
                 onSend = {
                     viewModel.sendText(textInput)
                     textInput = ""
+                    keyboardController?.hide()
                 },
                 isConnected = uiState.isConnected,
-                isMuted = uiState.isMuted,
-                listeningState = uiState.listeningState,
+                isRecording = uiState.isRecording,
                 isPlayingAudio = uiState.isPlayingAudio,
                 isResponding = page.isResponding,
-                onToggleMute = { viewModel.toggleMute() },
+                onPttStart = { viewModel.startPushToTalk() },
+                onPttEnd = { viewModel.stopPushToTalk() },
                 onPickImage = { imagePicker.launch("image/*") },
             )
         }
@@ -202,11 +199,12 @@ private fun WorkspaceSelector(
 }
 
 @Composable
-private fun ConnectionIndicator(isConnected: Boolean) {
+private fun ConnectionIndicator(isConnected: Boolean, onClick: () -> Unit) {
     val color = if (isConnected) MaterialTheme.colorScheme.primary
     else MaterialTheme.colorScheme.error
 
     Surface(
+        onClick = onClick,
         shape = MaterialTheme.shapes.small,
         color = color.copy(alpha = 0.15f),
         modifier = Modifier.padding(horizontal = 4.dp)
@@ -220,17 +218,18 @@ private fun ConnectionIndicator(isConnected: Boolean) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BottomInputBar(
     textInput: String,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     isConnected: Boolean,
-    isMuted: Boolean,
-    listeningState: VadState,
+    isRecording: Boolean,
     isPlayingAudio: Boolean,
     isResponding: Boolean,
-    onToggleMute: () -> Unit,
+    onPttStart: () -> Unit,
+    onPttEnd: () -> Unit,
     onPickImage: () -> Unit,
 ) {
     Surface(
@@ -242,19 +241,18 @@ private fun BottomInputBar(
                 // Sit above the keyboard when it's open, above the nav bar when it's not.
                 .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime)),
         ) {
-            // Status indicator
-            if (isConnected && !isMuted) {
-                ListeningIndicator(
-                    listeningState = listeningState,
-                    isPlayingAudio = isPlayingAudio,
-                    isResponding = isResponding,
-                )
-            }
+            // Status line (recording / speaking / thinking)
+            StatusIndicator(
+                isRecording = isRecording,
+                isPlayingAudio = isPlayingAudio,
+                isResponding = isResponding,
+            )
 
+            // Compact text row — typing is secondary to voice now.
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(8.dp),
+                    .padding(horizontal = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 // Image picker button
@@ -265,32 +263,36 @@ private fun BottomInputBar(
                     Icon(Icons.Default.Image, contentDescription = "Send image")
                 }
 
-                // Text input
                 OutlinedTextField(
                     value = textInput,
                     onValueChange = onTextChange,
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message...") },
+                    placeholder = { Text("Type a message...") },
                     maxLines = 4,
                     enabled = isConnected,
-                    trailingIcon = {
-                        if (textInput.isNotBlank()) {
-                            IconButton(onClick = onSend) {
-                                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
-                            }
-                        }
-                    }
                 )
 
                 Spacer(Modifier.width(8.dp))
 
-                // Mute/unmute toggle (interrupt button removed — voice interrupts automatically)
-                RecordButton(
-                    isMuted = isMuted,
+                // Send button — blank message pings the server (health check).
+                FilledIconButton(
+                    onClick = onSend,
+                    enabled = isConnected,
+                    modifier = Modifier.size(48.dp),
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                }
+            }
+
+            // Primary control: big hold-to-talk button. Hide it while the keyboard
+            // is open so it doesn't crowd the typing experience.
+            if (!WindowInsets.isImeVisible) {
+                PushToTalkButton(
+                    isRecording = isRecording,
                     isEnabled = isConnected,
-                    listeningState = listeningState,
-                    isPlayingAudio = isPlayingAudio,
-                    onToggleMute = onToggleMute,
+                    onPressStart = onPttStart,
+                    onPressEnd = onPttEnd,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
                 )
             }
         }
@@ -298,20 +300,19 @@ private fun BottomInputBar(
 }
 
 @Composable
-private fun ListeningIndicator(
-    listeningState: VadState,
+private fun StatusIndicator(
+    isRecording: Boolean,
     isPlayingAudio: Boolean,
     isResponding: Boolean,
 ) {
-    val isSpeech = listeningState == VadState.SPEECH || listeningState == VadState.COOLDOWN
-    val isListening = listeningState == VadState.LISTENING
+    val isSpeech = isRecording
 
     val statusText: String
-    val statusColor: androidx.compose.ui.graphics.Color
+    val statusColor: Color
 
     when {
-        isSpeech -> {
-            statusText = "Hearing you..."
+        isRecording -> {
+            statusText = "Listening..."
             statusColor = MaterialTheme.colorScheme.error
         }
         isPlayingAudio -> {
@@ -321,10 +322,6 @@ private fun ListeningIndicator(
         isResponding -> {
             statusText = "Thinking..."
             statusColor = MaterialTheme.colorScheme.secondary
-        }
-        isListening -> {
-            statusText = "Listening..."
-            statusColor = MaterialTheme.colorScheme.primary
         }
         else -> return
     }

@@ -1,8 +1,12 @@
 package com.walkietalkie.audio
 
 import android.content.Context
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.net.Uri
 import android.util.Log
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -27,26 +31,80 @@ class AudioPlayer(private val context: Context) {
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying
 
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var pauseOtherApps = false
+
     fun initialize() {
         if (player != null) return
         player = ExoPlayer.Builder(context).build().apply {
+            // Configure audio attributes for speech/assistant content
+            val audioAttributes = AudioAttributes.Builder()
+                .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
+                .setUsage(C.USAGE_ASSISTANT)
+                .build()
+            setAudioAttributes(audioAttributes, true)
+
             addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(state: Int) {
                     _isPlaying.value = state == Player.STATE_READY && isPlaying
                     if (state == Player.STATE_ENDED) {
                         _isPlaying.value = false
+                        abandonAudioFocus()
                     }
                 }
 
                 override fun onIsPlayingChanged(isPlayingNow: Boolean) {
                     _isPlaying.value = isPlayingNow
+                    if (!isPlayingNow) {
+                        abandonAudioFocus()
+                    }
                 }
             })
         }
     }
 
+    fun setPauseOtherApps(pause: Boolean) {
+        pauseOtherApps = pause
+    }
+
+    private fun requestAudioFocus() {
+        if (!pauseOtherApps) return
+
+        val focusGain = if (pauseOtherApps) {
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+        } else {
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+        }
+
+        val request = AudioFocusRequest.Builder(focusGain)
+            .setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .setUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
+                    .build()
+            )
+            .setWillPauseWhenDucked(true)
+            .build()
+
+        audioFocusRequest = request
+        audioManager.requestAudioFocus(request)
+        Log.d(TAG, "Audio focus requested")
+    }
+
+    private fun abandonAudioFocus() {
+        audioFocusRequest?.let {
+            audioManager.abandonAudioFocusRequest(it)
+            audioFocusRequest = null
+            Log.d(TAG, "Audio focus abandoned")
+        }
+    }
+
     fun onTtsStart() {
         val p = player ?: return
+
+        // Request audio focus to pause/duck other apps if enabled
+        requestAudioFocus()
 
         // Tear down any previous stream
         p.stop()
@@ -82,9 +140,11 @@ class AudioPlayer(private val context: Context) {
         streamingSource?.close()
         streamingSource = null
         _isPlaying.value = false
+        abandonAudioFocus()
     }
 
     fun release() {
+        abandonAudioFocus()
         player?.release()
         player = null
         streamingSource?.close()

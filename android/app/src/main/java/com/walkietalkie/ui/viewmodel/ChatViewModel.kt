@@ -2,6 +2,7 @@ package com.walkietalkie.ui.viewmodel
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.util.Log
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -26,6 +27,7 @@ import kotlinx.coroutines.launch
 private val Context.settingsStore by preferencesDataStore("settings")
 private val KEY_SERVER_URL = stringPreferencesKey("server_url")
 private val KEY_MUTED = booleanPreferencesKey("muted")
+private val KEY_PAUSE_MEDIA = booleanPreferencesKey("pause_media")
 
 private const val TAG = "ChatViewModel"
 
@@ -58,10 +60,13 @@ data class ChatUiState(
     val activePageIndex: Int = 0,
     val isConnected: Boolean = false,
     val isMuted: Boolean = false,
+    // True while the user is holding the push-to-talk button (main screen).
+    val isRecording: Boolean = false,
     val listeningState: VadState = VadState.IDLE,
     val isPlayingAudio: Boolean = false,
     val serverUrl: String = BuildConfig.DEFAULT_SERVER_URL,
     val workspaces: List<Workspace> = emptyList(),
+    val pauseMediaDuringTts: Boolean = false,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -79,6 +84,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // Currently streaming assistant message ID (for the active page)
     private var streamingMessageId: String? = null
+
+    // True once we've told the user the server is unavailable, so the silent
+    // reconnect loop doesn't spam the chat. Reset on a successful connect.
+    private var unavailableAnnounced = false
+
+    // Set when the user (or a settings change) deliberately disconnects, so the
+    // resulting Disconnected event isn't mislabelled as "server unavailable".
+    private var intentionalDisconnect = false
+
+    // Timestamp (ms) of an outstanding user-initiated ping, for RTT reporting.
+    // 0 means no ping is in flight.
+    private var pingSentAt = 0L
 
     init {
         audioPlayer.initialize()
@@ -101,6 +118,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val muted = prefs[KEY_MUTED] ?: false
                 _uiState.update { it.copy(isMuted = muted) }
+                val pauseMedia = prefs[KEY_PAUSE_MEDIA] ?: false
+                _uiState.update { it.copy(pauseMediaDuringTts = pauseMedia) }
+                audioPlayer.setPauseOtherApps(pauseMedia)
             }
             if (isServerUrlConfigured()) {
                 addSystemMessage("Starting up...")
@@ -115,14 +135,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val wasConnected = _uiState.value.isConnected
                 _uiState.update { it.copy(isConnected = connected) }
                 if (connected) {
+                    unavailableAnnounced = false
+                    // Connected — show the notification (the badge means "connected").
+                    startConnectionService()
                     addSystemMessage("Connected")
-                    // Auto-start listening on connect (if not muted)
-                    if (!_uiState.value.isMuted) {
-                        startListening()
+                    // No auto-listen: the main screen is push-to-talk, so the mic
+                    // only opens while the user holds the button. Ambient mode
+                    // handles hands-free VAD listening on its own.
+                } else {
+                    // Not connected — stop any capture and tear down the notification.
+                    if (wasConnected) {
+                        stopPushToTalk()
+                        stopListening()
                     }
-                } else if (wasConnected) {
-                    // Disconnected — stop listening
-                    stopListening()
+                    stopConnectionService()
                 }
             }
         }
@@ -167,10 +193,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 val status = when {
                     !state.isConnected -> "Disconnected"
-                    state.isMuted -> "Muted"
+                    state.isRecording -> "Listening..."          // push-to-talk held
                     state.isPlayingAudio -> "Speaking"
                     activePage?.isResponding == true -> "Thinking..."
-                    isSpeech -> "Hearing you..."
+                    state.isMuted -> "Muted"                     // ambient, muted
+                    isSpeech -> "Hearing you..."                 // ambient VAD
                     state.listeningState == VadState.LISTENING -> "Listening"
                     else -> "Connected"
                 }
@@ -195,6 +222,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() {
+        intentionalDisconnect = true
         stopListening()
         wsClient.disconnect()
         _uiState.update { it.copy(isConnected = false) }
@@ -215,6 +243,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             stopListening()
         } else if (_uiState.value.isConnected) {
             startListening()
+        }
+    }
+
+    fun togglePauseMedia() {
+        val nowPaused = !_uiState.value.pauseMediaDuringTts
+        _uiState.update { it.copy(pauseMediaDuringTts = nowPaused) }
+        audioPlayer.setPauseOtherApps(nowPaused)
+
+        // Persist preference
+        viewModelScope.launch {
+            getApplication<Application>().settingsStore.edit { prefs ->
+                prefs[KEY_PAUSE_MEDIA] = nowPaused
+            }
         }
     }
 
@@ -253,10 +294,88 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ---- Push-to-talk (main screen) ----
+    // The mic is closed by default. Holding the button opens it: press → stream
+    // every chunk, release → end the utterance. No VAD, no thresholds — the user
+    // decides exactly when they're talking, like a real walkie-talkie.
+
+    fun startPushToTalk() {
+        if (!_uiState.value.isConnected || _uiState.value.isRecording) return
+
+        // Barge-in: pressing to talk while Claude is speaking/thinking interrupts it.
+        val state = _uiState.value
+        if (state.isPlayingAudio || state.pages[state.activePageIndex].isResponding) {
+            interrupt(sendInterruptMsg = true)
+        }
+
+        wsClient.sendJson(AudioStartMsg())
+        audioSessionActive = true
+        _uiState.update { it.copy(isRecording = true) }
+        audioCapture.start(viewModelScope) { pcmBytes, _ ->
+            wsClient.sendMicAudio(pcmBytes)
+        }
+    }
+
+    fun stopPushToTalk() {
+        if (!_uiState.value.isRecording) return
+        audioCapture.stop()
+        if (audioSessionActive) {
+            wsClient.sendJson(AudioEndMsg())
+            audioSessionActive = false
+        }
+        _uiState.update { it.copy(isRecording = false) }
+    }
+
+    // ---- Ambient mode (hands-free VAD) ----
+    // Ambient is the one place that still uses voice-activity detection. Start it
+    // on entry and stop on exit so the mic stays closed on the main screen.
+
+    fun onEnterAmbient() {
+        if (_uiState.value.isConnected && !_uiState.value.isMuted) startListening()
+    }
+
+    fun onExitAmbient() {
+        stopListening()
+    }
+
     fun sendText(text: String) {
-        if (text.isBlank()) return
+        if (text.isBlank()) {
+            // Empty send = a "you there?" health check rather than a no-op.
+            pingServer()
+            return
+        }
         addUserMessage(text)
         wsClient.sendJson(TextMsg(text = text))
+    }
+
+    /** Start the foreground service so its notification shows we're connected. */
+    private fun startConnectionService() {
+        val ctx = getApplication<Application>()
+        try {
+            ctx.startForegroundService(Intent(ctx, WalkieTalkieService::class.java))
+        } catch (e: Exception) {
+            // Android forbids starting a foreground service from the background
+            // (e.g. a reconnect while the app is backgrounded). Skip the
+            // notification in that case rather than crash.
+            Log.w(TAG, "Couldn't start connection service", e)
+        }
+    }
+
+    /** Stop the foreground service, removing its notification. */
+    private fun stopConnectionService() {
+        val ctx = getApplication<Application>()
+        ctx.stopService(Intent(ctx, WalkieTalkieService::class.java))
+    }
+
+    /** Ping the server to check it's alive and measure round-trip time. */
+    fun pingServer() {
+        if (!_uiState.value.isConnected) {
+            addSystemMessage("Not connected — server unreachable.")
+            return
+        }
+        pingSentAt = System.currentTimeMillis()
+        addSystemMessage("Pinging server…")
+        wsClient.sendJson(PingMsg())
     }
 
     fun sendImage(uri: Uri, text: String? = null) {
@@ -331,14 +450,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun handleWsEvent(event: WsEvent) {
         when (event) {
             is WsEvent.Connecting -> {
-                val msg = if (event.attempt == 1) "Connecting to ${event.url}..."
-                    else "Reconnecting (attempt ${event.attempt})..."
-                addSystemMessage(msg)
+                // Only announce the very first attempt; stay quiet while the
+                // background reconnect loop keeps retrying.
+                if (event.attempt == 1) addSystemMessage("Connecting…")
             }
             is WsEvent.TextReceived -> handleServerMessage(event.text)
             is WsEvent.BinaryReceived -> handleBinaryMessage(event.data)
-            is WsEvent.Failure -> addSystemMessage("Connection error: ${event.error.message}")
-            is WsEvent.Disconnected -> addSystemMessage("Disconnected")
+            is WsEvent.Failure -> {
+                // Couldn't reach the server. Say so once and then let the
+                // reconnect loop retry silently — no per-attempt spam.
+                if (!unavailableAnnounced) {
+                    unavailableAnnounced = true
+                    addSystemMessage("Server unavailable — retrying in the background…")
+                }
+            }
+            is WsEvent.Disconnected -> when {
+                intentionalDisconnect -> {
+                    intentionalDisconnect = false
+                    addSystemMessage("Disconnected")
+                }
+                // Lost an established connection (e.g. server restarted). Announce
+                // once; the reconnect loop takes it from here.
+                !unavailableAnnounced -> {
+                    unavailableAnnounced = true
+                    addSystemMessage("Server unavailable — retrying in the background…")
+                }
+            }
             is WsEvent.Connected -> {} // handled by isConnected flow
         }
     }
@@ -414,7 +551,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 addSystemMessage("Workspace: ${msg.msg.name}")
             }
 
-            is ServerMessage.Pong -> {} // heartbeat
+            is ServerMessage.Pong -> {
+                // Only report pongs we asked for (ignore background heartbeats).
+                if (pingSentAt > 0L) {
+                    val rtt = System.currentTimeMillis() - pingSentAt
+                    pingSentAt = 0L
+                    addSystemMessage("Server responsive ✓ (${rtt} ms)")
+                }
+            }
             is ServerMessage.Unknown -> Log.w(TAG, "Unknown message type: ${msg.type}")
         }
     }

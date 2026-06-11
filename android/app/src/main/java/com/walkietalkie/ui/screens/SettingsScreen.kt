@@ -90,6 +90,35 @@ fun SettingsScreen(
             ) {
                 Text(if (uiState.isConnected) "Disconnect" else "Connect")
             }
+
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+            Text(
+                text = "Audio",
+                style = MaterialTheme.typography.titleMedium,
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Pause media during responses",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    Text(
+                        text = "Pauses Spotify, YouTube, etc. while assistant speaks",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = uiState.pauseMediaDuringTts,
+                    onCheckedChange = { viewModel.togglePauseMedia() },
+                )
+            }
         }
     }
 }

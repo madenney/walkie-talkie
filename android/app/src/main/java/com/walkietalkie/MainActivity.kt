@@ -1,8 +1,9 @@
 package com.walkietalkie
 
 import android.Manifest
-import android.content.Intent
+import android.content.Context
 import android.os.Bundle
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -17,7 +18,6 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import com.walkietalkie.service.WalkieTalkieService
 import com.walkietalkie.ui.screens.AmbientScreen
 import com.walkietalkie.ui.screens.ChatScreen
 import com.walkietalkie.ui.screens.SettingsScreen
@@ -41,8 +41,9 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.POST_NOTIFICATIONS,
         ))
 
-        // Start foreground service for background operation
-        startForegroundService(Intent(this, WalkieTalkieService::class.java))
+        // The foreground service (and its notification) is started/stopped by the
+        // ViewModel based on connection state — connected shows the notification,
+        // disconnected removes it.
 
         enableEdgeToEdge()
 
@@ -86,6 +87,26 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // While the app is in the foreground, let it show over the lock screen so
+        // waking the phone drops you straight back into the app — past security.
+        setShowWhenLocked(true)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Decide whether to keep that lock-screen bypass armed. If the screen is
+        // still on, the user deliberately left the app (home / another app), so
+        // disarm and let the next lock be fully secure. If the screen went off
+        // (power button or timeout) while we were foreground, keep it armed so
+        // waking returns straight to the app.
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isInteractive) {
+            setShowWhenLocked(false)
         }
     }
 }
