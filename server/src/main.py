@@ -77,10 +77,21 @@ app = FastAPI(title="Walkie Talkie", version="0.1.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
+    # Liveness + readiness. Reaching this means the server is up; "degraded"
+    # flags that a critical engine (STT/TTS) failed to load, so a half-broken
+    # server doesn't report a healthy green. Shape matches the Shelf status
+    # check contract: {status, detail}.
+    stt_up = stt_engine is not None
+    tts_up = tts_engine is not None
+    ready = stt_up and tts_up
     return {
-        "status": "ok",
-        "stt": stt_engine is not None,
-        "tts": tts_engine is not None,
+        "status": "ok" if ready else "degraded",
+        "detail": (
+            f"stt={'up' if stt_up else 'down'} "
+            f"tts={'up' if tts_up else 'down'} · {len(sessions)} session(s)"
+        ),
+        "stt": stt_up,
+        "tts": tts_up,
         "active_sessions": len(sessions),
     }
 
