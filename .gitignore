@@ -20,6 +20,7 @@ android/.idea/
 # Server runtime
 server/server.log
 server/.server.pid
+server/.wt_sessions.json
 
 # Config (contains personal paths — use config.example.yaml as template)
 server/config.yaml

@@ -55,6 +55,13 @@ data class SelectWorkspaceMsg(
 @Serializable
 data class PingMsg(val type: String = "ping")
 
+@Serializable
+data class PermissionResponseMsg(
+    val type: String = "permission_response",
+    val id: String,
+    val approved: Boolean
+)
+
 // --- Incoming (server → phone) ---
 
 @Serializable
@@ -128,6 +135,37 @@ data class WorkspaceSelectedMsg(
     val path: String
 )
 
+@Serializable
+data class PermissionRequestMsg(
+    val type: String,
+    val id: String,
+    @SerialName("tool_name") val toolName: String,
+    val summary: String,
+    val detail: String = ""
+)
+
+@Serializable
+data class PermissionResolvedMsg(
+    val type: String,
+    val id: String,
+    val approved: Boolean
+)
+
+@Serializable
+data class HistoryMessageMsg(
+    val role: String,
+    val text: String,
+    @SerialName("tool_name") val toolName: String? = null,
+    @SerialName("tool_output") val toolOutput: String? = null,
+    val success: Boolean? = null
+)
+
+@Serializable
+data class ConversationHistoryMsg(
+    val type: String,
+    val messages: List<HistoryMessageMsg> = emptyList()
+)
+
 /**
  * Represents any incoming server message, parsed by type field.
  */
@@ -143,6 +181,9 @@ sealed class ServerMessage {
     data object Pong : ServerMessage()
     data class WorkspaceList(val msg: WorkspaceListMsg) : ServerMessage()
     data class WorkspaceSelected(val msg: WorkspaceSelectedMsg) : ServerMessage()
+    data class PermissionRequest(val msg: PermissionRequestMsg) : ServerMessage()
+    data class PermissionResolved(val msg: PermissionResolvedMsg) : ServerMessage()
+    data class ConversationHistory(val msg: ConversationHistoryMsg) : ServerMessage()
     data class Unknown(val type: String) : ServerMessage()
 }
 
@@ -162,6 +203,9 @@ fun parseServerMessage(json: String): ServerMessage {
         "pong" -> ServerMessage.Pong
         "workspace_list" -> ServerMessage.WorkspaceList(WsJson.decodeFromString(json))
         "workspace_selected" -> ServerMessage.WorkspaceSelected(WsJson.decodeFromString(json))
+        "permission_request" -> ServerMessage.PermissionRequest(WsJson.decodeFromString(json))
+        "permission_resolved" -> ServerMessage.PermissionResolved(WsJson.decodeFromString(json))
+        "conversation_history" -> ServerMessage.ConversationHistory(WsJson.decodeFromString(json))
         else -> ServerMessage.Unknown(type)
     }
 }

@@ -24,11 +24,20 @@ class WhisperSTT(STTEngine):
         if self._model is None:
             from faster_whisper import WhisperModel
             log.info("Loading Whisper model: %s", self.model_size)
-            self._model = WhisperModel(
-                self.model_size,
-                device="auto",
-                compute_type="auto",
-            )
+            # Use the local cache only — faster-whisper otherwise contacts
+            # HuggingFace to revalidate the cached model, and that network call
+            # can hang indefinitely, freezing transcription. Fall back to a
+            # download only if the model isn't cached yet.
+            try:
+                self._model = WhisperModel(
+                    self.model_size, device="auto", compute_type="auto",
+                    local_files_only=True,
+                )
+            except Exception:
+                log.warning("Whisper %s not cached; downloading", self.model_size)
+                self._model = WhisperModel(
+                    self.model_size, device="auto", compute_type="auto",
+                )
             log.info("Whisper model loaded")
         return self._model
 

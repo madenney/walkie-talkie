@@ -126,6 +126,7 @@ class WsClient(
             is InterruptMsg -> WsJson.encodeToString(InterruptMsg.serializer(), msg)
             is SelectWorkspaceMsg -> WsJson.encodeToString(SelectWorkspaceMsg.serializer(), msg)
             is PingMsg -> WsJson.encodeToString(PingMsg.serializer(), msg)
+            is PermissionResponseMsg -> WsJson.encodeToString(PermissionResponseMsg.serializer(), msg)
             else -> return false
         }
         return sendText(json)

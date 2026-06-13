@@ -55,6 +55,14 @@ data class ChatPage(
     val isResponding: Boolean = false,
 )
 
+/** A tool the server is asking us to approve before it runs (e.g. a shell command). */
+data class PendingApproval(
+    val id: String,
+    val toolName: String,
+    val summary: String,
+    val detail: String,
+)
+
 data class ChatUiState(
     val pages: List<ChatPage> = listOf(ChatPage()),
     val activePageIndex: Int = 0,
@@ -67,6 +75,8 @@ data class ChatUiState(
     val serverUrl: String = BuildConfig.DEFAULT_SERVER_URL,
     val workspaces: List<Workspace> = emptyList(),
     val pauseMediaDuringTts: Boolean = false,
+    // Set when Claude wants to run a gated tool and is waiting for yes/no.
+    val pendingApproval: PendingApproval? = null,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -96,6 +106,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Timestamp (ms) of an outstanding user-initiated ping, for RTT reporting.
     // 0 means no ping is in flight.
     private var pingSentAt = 0L
+
+    // Phone-side auto-deny timer for an outstanding approval prompt.
+    private var approvalTimeoutJob: Job? = null
 
     init {
         audioPlayer.initialize()
@@ -551,6 +564,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 addSystemMessage("Workspace: ${msg.msg.name}")
             }
 
+            is ServerMessage.ConversationHistory -> {
+                // Replayed scrollback for a resumed session — repaint the page so
+                // a continued conversation isn't visually blank on reopen.
+                val restored = msg.msg.messages.map { h ->
+                    val role = when (h.role) {
+                        "user" -> Role.USER
+                        "assistant" -> Role.ASSISTANT
+                        "tool" -> Role.TOOL
+                        else -> Role.SYSTEM
+                    }
+                    ChatMessage(
+                        role = role,
+                        text = h.text,
+                        toolName = h.toolName,
+                        toolOutput = h.toolOutput,
+                    )
+                }
+                if (restored.isNotEmpty()) {
+                    updateActivePage { it.copy(messages = restored) }
+                }
+            }
+
             is ServerMessage.Pong -> {
                 // Only report pongs we asked for (ignore background heartbeats).
                 if (pingSentAt > 0L) {
@@ -559,7 +594,49 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     addSystemMessage("Server responsive ✓ (${rtt} ms)")
                 }
             }
+            is ServerMessage.PermissionRequest -> {
+                val m = msg.msg
+                approvalTimeoutJob?.cancel()
+                _uiState.update {
+                    it.copy(pendingApproval = PendingApproval(m.id, m.toolName, m.summary, m.detail))
+                }
+                val line = if (m.detail.isNotBlank()) "${m.summary}: ${m.detail}" else m.summary
+                addSystemMessage("⚠️ Approval needed — $line")
+                startApprovalTimeout(m.id)
+            }
+            is ServerMessage.PermissionResolved -> {
+                // The approval settled server-side (often a spoken yes/no). Dismiss
+                // the prompt if it's still showing; the tap path already cleared it.
+                val pending = _uiState.value.pendingApproval
+                if (pending != null && pending.id == msg.msg.id) {
+                    approvalTimeoutJob?.cancel()
+                    addSystemMessage(if (msg.msg.approved) "Approved ✓" else "Denied ✗")
+                    _uiState.update { it.copy(pendingApproval = null) }
+                }
+            }
             is ServerMessage.Unknown -> Log.w(TAG, "Unknown message type: ${msg.type}")
+        }
+    }
+
+    /** User tapped Approve/Deny on a pending tool-permission prompt. */
+    fun respondToApproval(approved: Boolean) {
+        val pending = _uiState.value.pendingApproval ?: return
+        approvalTimeoutJob?.cancel()
+        wsClient.sendJson(PermissionResponseMsg(id = pending.id, approved = approved))
+        addSystemMessage(if (approved) "Approved ✓" else "Denied ✗")
+        _uiState.update { it.copy(pendingApproval = null) }
+    }
+
+    /** Auto-deny if the user doesn't respond, so a forgotten prompt can't hang. */
+    private fun startApprovalTimeout(id: String) {
+        approvalTimeoutJob?.cancel()
+        approvalTimeoutJob = viewModelScope.launch {
+            delay(30_000)
+            if (_uiState.value.pendingApproval?.id == id) {
+                wsClient.sendJson(PermissionResponseMsg(id = id, approved = false))
+                addSystemMessage("Approval timed out — denied")
+                _uiState.update { it.copy(pendingApproval = null) }
+            }
         }
     }
 

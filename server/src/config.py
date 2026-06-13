@@ -15,7 +15,9 @@ class ServerConfig(BaseModel):
 
 
 class ClaudeConfig(BaseModel):
-    model: str = "claude-sonnet-4-5-20250929"
+    # With the Agent SDK on subscription auth, the model defaults to the CLI's
+    # configured model when this is left blank.
+    model: str = ""
     max_tokens: int = 8192
     max_conversation_turns: int = 50
 
@@ -45,8 +47,13 @@ class VADConfig(BaseModel):
 
 
 class SafetyConfig(BaseModel):
-    command_timeout: int = 30
-    blocked_commands: list[str] = []
+    # Tools that require explicit user approval (spoken to the phone, awaits
+    # yes/no) before they run. Everything else auto-runs. Bash is the unconfined
+    # shell, so it's gated by default; Write/Edit are confined to the workspace.
+    require_approval: list[str] = ["Bash"]
+    # Seconds to wait for a phone approval before auto-denying (covers a phone
+    # that's asleep or disconnected).
+    approval_timeout: int = 35
 
 
 class WorkspaceConfig(BaseModel):
@@ -119,5 +126,8 @@ def load_settings(config_path: str | None = None) -> Settings:
                         name=proj.get("label", key),
                         path=cwd,
                     ))
+
+    # Alphabetize the project list (case-insensitive) for a stable, scannable order.
+    settings.workspaces.sort(key=lambda w: w.name.lower())
 
     return settings

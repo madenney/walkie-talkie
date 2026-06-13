@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 
+from pathlib import Path
+
+from .claude.session_store import SessionStore
 from .config import load_settings
-from .claude.client import ClaudeClient
-from .claude.tool_executor import ToolExecutor
-from .utils.safety import PathSandbox
 from .ws.handler import ConnectionHandler
 from .ws.session import Session, SessionRegistry
 
@@ -22,21 +23,11 @@ log = logging.getLogger(__name__)
 
 settings = load_settings()
 
-# Sandbox and tool executor
-sandbox = PathSandbox(settings.workspace_root)
-tool_executor = ToolExecutor(
-    sandbox=sandbox,
-    blocked_commands=settings.safety.blocked_commands,
-    command_timeout=settings.safety.command_timeout,
-)
-
-# Claude client
-claude_client = ClaudeClient(
-    api_key=settings.anthropic_api_key,
-    model=settings.claude.model,
-    max_tokens=settings.claude.max_tokens,
-    tool_executor=tool_executor,
-)
+# Force the Claude Agent SDK to authenticate through the logged-in `claude` CLI
+# (subscription), not pay-as-you-go API credits. The SDK spawns the CLI as a
+# subprocess inheriting this environment, so the key must be gone before then.
+if os.environ.pop("ANTHROPIC_API_KEY", None):
+    log.info("ANTHROPIC_API_KEY unset → Agent SDK uses subscription auth")
 
 # STT engine (lazy-loaded)
 stt_engine = None
@@ -68,6 +59,10 @@ else:
 
 sessions = SessionRegistry()
 
+# Per-workspace conversation continuity: remembers the last SDK session id for
+# each workspace so reopening the app (or restarting the server) resumes it.
+session_store = SessionStore(Path(__file__).parent.parent / ".wt_sessions.json")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -98,14 +93,11 @@ async def websocket_endpoint(ws: WebSocket):
     handler = ConnectionHandler(
         ws=ws,
         session=session,
-        claude_client=claude_client,
+        settings=settings,
         stt_engine=stt_engine,
         tts_engine=tts_engine,
         workspaces=settings.workspaces,
-        safety_config={
-            "blocked_commands": settings.safety.blocked_commands,
-            "command_timeout": settings.safety.command_timeout,
-        },
+        session_store=session_store,
     )
     log.info("New connection: session %s", session.session_id)
     try:

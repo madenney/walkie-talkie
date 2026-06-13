@@ -57,6 +57,12 @@ class Ping(BaseModel):
     type: Literal["ping"] = "ping"
 
 
+class PermissionResponse(BaseModel):
+    type: Literal["permission_response"] = "permission_response"
+    id: str
+    approved: bool
+
+
 # --- Server → Phone messages ---
 
 class Transcription(BaseModel):
@@ -108,6 +114,22 @@ class Pong(BaseModel):
     type: Literal["pong"] = "pong"
 
 
+class PermissionRequest(BaseModel):
+    type: Literal["permission_request"] = "permission_request"
+    id: str
+    tool_name: str
+    summary: str            # short spoken/displayed line, e.g. "run a shell command"
+    detail: str = ""        # the actual command/path for the on-screen card
+
+
+class PermissionResolved(BaseModel):
+    """Tells the phone an approval is settled (by voice/tap/timeout) so it can
+    dismiss the prompt — needed because voice answers don't originate on the app."""
+    type: Literal["permission_resolved"] = "permission_resolved"
+    id: str
+    approved: bool
+
+
 class WorkspaceList(BaseModel):
     type: Literal["workspace_list"] = "workspace_list"
     workspaces: list[dict[str, str]]  # [{name, path}]
@@ -119,15 +141,30 @@ class WorkspaceSelected(BaseModel):
     path: str
 
 
+class HistoryMessage(BaseModel):
+    role: str               # "user" | "assistant" | "tool"
+    text: str
+    tool_name: str | None = None
+    tool_output: str | None = None
+    success: bool | None = None
+
+
+class ConversationHistory(BaseModel):
+    """Replayed scrollback for a resumed session, sent right after selection."""
+    type: Literal["conversation_history"] = "conversation_history"
+    messages: list[HistoryMessage] = []
+
+
 # Union types for parsing
 IncomingMessage = (
     AudioStart | AudioEnd | TextMessage | ImageMessage | Interrupt | Ping
-    | SelectWorkspace
+    | SelectWorkspace | PermissionResponse
 )
 
 OutgoingMessage = (
     Transcription | ResponseDelta | ResponseEnd | ToolUse | ToolResult
     | TTSStart | TTSEnd | Error | Pong | WorkspaceList | WorkspaceSelected
+    | PermissionRequest | PermissionResolved | ConversationHistory
 )
 
 INCOMING_TYPES: dict[str, type[BaseModel]] = {
@@ -138,6 +175,7 @@ INCOMING_TYPES: dict[str, type[BaseModel]] = {
     "interrupt": Interrupt,
     "ping": Ping,
     "select_workspace": SelectWorkspace,
+    "permission_response": PermissionResponse,
 }
 
 

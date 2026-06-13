@@ -43,7 +43,12 @@ class AudioPlayer(private val context: Context) {
                 .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
                 .setUsage(C.USAGE_ASSISTANT)
                 .build()
-            setAudioAttributes(audioAttributes, true)
+            // handleAudioFocus MUST be false here: ExoPlayer only allows automatic
+            // focus handling for USAGE_MEDIA/USAGE_GAME, and our usage is
+            // USAGE_ASSISTANT — passing true throws and crashes the app on launch.
+            // We manage focus ourselves (requestAudioFocus/abandonAudioFocus) to
+            // duck/pause other apps when the "pause other media" setting is on.
+            setAudioAttributes(audioAttributes, false)
 
             addListener(object : Player.Listener {
                 override fun onPlaybackStateChanged(state: Int) {

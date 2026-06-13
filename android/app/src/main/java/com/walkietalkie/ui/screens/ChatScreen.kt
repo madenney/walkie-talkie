@@ -5,6 +5,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.walkietalkie.ui.components.MessageBubble
 import com.walkietalkie.ui.components.PushToTalkButton
@@ -44,19 +47,136 @@ fun ChatScreen(
         viewModel.onPageChanged(pagerState.settledPage)
     }
 
-    HorizontalPager(
-        state = pagerState,
-        modifier = Modifier.fillMaxSize(),
-        beyondViewportPageCount = 1,
-    ) { pageIndex ->
-        val page = uiState.pages[pageIndex]
-        ChatPageContent(
-            page = page,
-            uiState = uiState,
-            viewModel = viewModel,
-            onNavigateToSettings = onNavigateToSettings,
-            onNavigateToAmbient = onNavigateToAmbient,
-        )
+    Box(Modifier.fillMaxSize()) {
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+            beyondViewportPageCount = 1,
+        ) { pageIndex ->
+            val page = uiState.pages[pageIndex]
+            ChatPageContent(
+                page = page,
+                uiState = uiState,
+                viewModel = viewModel,
+                onNavigateToSettings = onNavigateToSettings,
+                onNavigateToAmbient = onNavigateToAmbient,
+            )
+        }
+
+        // Tool-permission prompt overlays everything until answered.
+        uiState.pendingApproval?.let { pending ->
+            ApprovalOverlay(
+                pending = pending,
+                isRecording = uiState.isRecording,
+                onApprove = { viewModel.respondToApproval(true) },
+                onDeny = { viewModel.respondToApproval(false) },
+                onSpeakStart = { viewModel.startPushToTalk() },
+                onSpeakEnd = { viewModel.stopPushToTalk() },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ApprovalOverlay(
+    pending: com.walkietalkie.ui.viewmodel.PendingApproval,
+    isRecording: Boolean,
+    onApprove: () -> Unit,
+    onDeny: () -> Unit,
+    onSpeakStart: () -> Unit,
+    onSpeakEnd: () -> Unit,
+) {
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.6f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        // Cap the dialog so it never runs off-screen; the detail area scrolls instead.
+        val maxDialogHeight = maxHeight * 0.85f
+        Surface(
+            shape = MaterialTheme.shapes.large,
+            tonalElevation = 8.dp,
+            shadowElevation = 12.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = maxDialogHeight)
+                .padding(24.dp),
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Icon(
+                    Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(40.dp),
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = pending.summary,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                if (pending.detail.isNotBlank()) {
+                    Spacer(Modifier.height(12.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f, fill = false),
+                    ) {
+                        Text(
+                            text = pending.detail,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontFamily = FontFamily.Monospace,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .verticalScroll(rememberScrollState())
+                                .padding(12.dp),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = onDeny,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(56.dp),
+                    ) {
+                        Text("Deny", style = MaterialTheme.typography.titleMedium)
+                    }
+                    Button(
+                        onClick = onApprove,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(56.dp),
+                    ) {
+                        Text("Approve", style = MaterialTheme.typography.titleMedium)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                // Hands-free: hold and say "yes" or "no".
+                PushToTalkButton(
+                    isRecording = isRecording,
+                    isEnabled = true,
+                    onPressStart = onSpeakStart,
+                    onPressEnd = onSpeakEnd,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = if (isRecording) "Listening — say yes or no" else "or hold to say yes / no",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
