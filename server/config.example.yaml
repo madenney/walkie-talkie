@@ -4,11 +4,16 @@ server:
 
 workspace_root: "~/walkie_talkie_workspace"
 
-# Optional: load workspaces from a projws projects.json
+# Projects Claude can work in. Each is shown (alphabetically) in the app.
+workspaces:
+  - name: "Sandbox"
+    path: "~/walkie_talkie_workspace"
+# Optional: instead of listing workspaces, load them from a projws projects.json
 # projws_path: "~/path/to/projws/projects.json"
 
 claude:
-  model: "claude-sonnet-4-5-20250929"
+  # Leave blank to use the model your `claude` CLI is configured with.
+  model: ""
   max_tokens: 8192
   max_conversation_turns: 50
 
@@ -33,9 +38,9 @@ vad:
   min_silence_duration_ms: 800
 
 safety:
-  command_timeout: 30
-  blocked_commands:
-    - "rm -rf /"
-    - "mkfs"
-    - "dd if="
-    - ":(){:|:&};:"
+  # Tools that pause and ask for approval on the phone before running.
+  # Everything else auto-runs. Approve/deny by tap or by saying "yes"/"no".
+  require_approval:
+    - "Bash"
+  # Seconds to wait for an approval before auto-denying.
+  approval_timeout: 35
