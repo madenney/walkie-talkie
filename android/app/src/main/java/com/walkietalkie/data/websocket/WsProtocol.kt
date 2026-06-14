@@ -74,18 +74,20 @@ data class TranscriptionMsg(
 @Serializable
 data class ResponseDeltaMsg(
     val type: String,
-    val text: String
+    val text: String,
+    val workspace: String = ""
 )
 
 @Serializable
-data class ResponseEndMsg(val type: String)
+data class ResponseEndMsg(val type: String, val workspace: String = "")
 
 @Serializable
 data class ToolUseMsg(
     val type: String,
     @SerialName("tool_name") val toolName: String,
     @SerialName("tool_id") val toolId: String,
-    val input: JsonObject = JsonObject(emptyMap())
+    val input: JsonObject = JsonObject(emptyMap()),
+    val workspace: String = ""
 )
 
 @Serializable
@@ -94,7 +96,8 @@ data class ToolResultMsg(
     @SerialName("tool_id") val toolId: String,
     @SerialName("tool_name") val toolName: String,
     val success: Boolean,
-    val output: String = ""
+    val output: String = "",
+    val workspace: String = ""
 )
 
 @Serializable
@@ -143,14 +146,16 @@ data class PermissionRequestMsg(
     val id: String,
     @SerialName("tool_name") val toolName: String,
     val summary: String,
-    val detail: String = ""
+    val detail: String = "",
+    val workspace: String = ""
 )
 
 @Serializable
 data class PermissionResolvedMsg(
     val type: String,
     val id: String,
-    val approved: Boolean
+    val approved: Boolean,
+    val workspace: String = ""
 )
 
 @Serializable
@@ -180,7 +185,8 @@ data class HistoryMessageMsg(
 @Serializable
 data class ConversationHistoryMsg(
     val type: String,
-    val messages: List<HistoryMessageMsg> = emptyList()
+    val messages: List<HistoryMessageMsg> = emptyList(),
+    val workspace: String = ""
 )
 
 /**
@@ -189,7 +195,7 @@ data class ConversationHistoryMsg(
 sealed class ServerMessage {
     data class Transcription(val msg: TranscriptionMsg) : ServerMessage()
     data class ResponseDelta(val msg: ResponseDeltaMsg) : ServerMessage()
-    data object ResponseEnd : ServerMessage()
+    data class ResponseEnd(val msg: ResponseEndMsg) : ServerMessage()
     data class ToolUse(val msg: ToolUseMsg) : ServerMessage()
     data class ToolResult(val msg: ToolResultMsg) : ServerMessage()
     data class TtsStart(val msg: TtsStartMsg) : ServerMessage()
@@ -212,7 +218,7 @@ fun parseServerMessage(json: String): ServerMessage {
     return when (type) {
         "transcription" -> ServerMessage.Transcription(WsJson.decodeFromString(json))
         "response_delta" -> ServerMessage.ResponseDelta(WsJson.decodeFromString(json))
-        "response_end" -> ServerMessage.ResponseEnd
+        "response_end" -> ServerMessage.ResponseEnd(WsJson.decodeFromString(json))
         "tool_use" -> ServerMessage.ToolUse(WsJson.decodeFromString(json))
         "tool_result" -> ServerMessage.ToolResult(WsJson.decodeFromString(json))
         "tts_start" -> ServerMessage.TtsStart(WsJson.decodeFromString(json))

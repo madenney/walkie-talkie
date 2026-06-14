@@ -75,8 +75,11 @@ fun ChatScreen(
             )
         }
 
-        // Tool-permission prompt overlays everything until answered.
-        uiState.pendingApproval?.let { pending ->
+        // Tool-permission prompt for the project you're currently looking at —
+        // pinned to its own page, so swiping away hides it and swiping back shows
+        // it again, rather than following you into the wrong window.
+        val activeWs = uiState.pages.getOrNull(uiState.activePageIndex)?.currentWorkspace
+        activeWs?.let { uiState.pendingApprovals[it] }?.let { pending ->
             ApprovalOverlay(
                 pending = pending,
                 isRecording = uiState.isRecording,
@@ -273,6 +276,7 @@ private fun ChatPageContent(
                     keyboardController?.hide()
                 },
                 isConnected = uiState.isConnected,
+                hasWorkspace = page.currentWorkspace != null,
                 isRecording = uiState.isRecording,
                 isPlayingAudio = uiState.isPlayingAudio,
                 isResponding = page.isResponding,
@@ -429,6 +433,7 @@ private fun BottomInputBar(
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     isConnected: Boolean,
+    hasWorkspace: Boolean,
     isRecording: Boolean,
     isPlayingAudio: Boolean,
     isResponding: Boolean,
@@ -436,6 +441,10 @@ private fun BottomInputBar(
     onPttEnd: () -> Unit,
     onPickImage: () -> Unit,
 ) {
+    // Can't send anything until a project is picked — gate input so you don't
+    // fire a command into the blank "Select project" page.
+    val canInput = isConnected && hasWorkspace
+
     Surface(
         shadowElevation = 8.dp,
     ) {
@@ -462,7 +471,7 @@ private fun BottomInputBar(
                 // Image picker button
                 IconButton(
                     onClick = onPickImage,
-                    enabled = isConnected,
+                    enabled = canInput,
                 ) {
                     Icon(Icons.Default.Image, contentDescription = "Send image")
                 }
@@ -471,9 +480,11 @@ private fun BottomInputBar(
                     value = textInput,
                     onValueChange = onTextChange,
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("Type a message...") },
+                    placeholder = {
+                        Text(if (hasWorkspace) "Type a message..." else "Pick a project to start")
+                    },
                     maxLines = 4,
-                    enabled = isConnected,
+                    enabled = canInput,
                 )
 
                 Spacer(Modifier.width(8.dp))
@@ -481,7 +492,7 @@ private fun BottomInputBar(
                 // Send button — blank message pings the server (health check).
                 FilledIconButton(
                     onClick = onSend,
-                    enabled = isConnected,
+                    enabled = canInput,
                     modifier = Modifier.size(48.dp),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
@@ -493,7 +504,7 @@ private fun BottomInputBar(
             if (!WindowInsets.isImeVisible) {
                 PushToTalkButton(
                     isRecording = isRecording,
-                    isEnabled = isConnected,
+                    isEnabled = canInput,
                     onPressStart = onPttStart,
                     onPressEnd = onPttEnd,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),

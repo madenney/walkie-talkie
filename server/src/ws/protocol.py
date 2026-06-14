@@ -71,13 +71,20 @@ class Transcription(BaseModel):
     is_final: bool = True
 
 
+# NOTE: every message the phone routes to a specific workspace's page carries a
+# `workspace` field, so the phone can ignore anything not meant for the page it's
+# on (during rapid workspace switches, repaints for the old workspace can still be
+# in flight). It's stamped centrally when sent — see WorkspacePool.send.
+
 class ResponseDelta(BaseModel):
     type: Literal["response_delta"] = "response_delta"
     text: str
+    workspace: str = ""
 
 
 class ResponseEnd(BaseModel):
     type: Literal["response_end"] = "response_end"
+    workspace: str = ""
 
 
 class ToolUse(BaseModel):
@@ -85,6 +92,7 @@ class ToolUse(BaseModel):
     tool_name: str
     tool_id: str
     input: dict[str, Any] = {}
+    workspace: str = ""
 
 
 class ToolResult(BaseModel):
@@ -93,6 +101,7 @@ class ToolResult(BaseModel):
     tool_name: str
     success: bool
     output: str = ""
+    workspace: str = ""
 
 
 class TTSStart(BaseModel):
@@ -120,6 +129,7 @@ class PermissionRequest(BaseModel):
     tool_name: str
     summary: str            # short spoken/displayed line, e.g. "run a shell command"
     detail: str = ""        # the actual command/path for the on-screen card
+    workspace: str = ""
 
 
 class PermissionResolved(BaseModel):
@@ -128,6 +138,7 @@ class PermissionResolved(BaseModel):
     type: Literal["permission_resolved"] = "permission_resolved"
     id: str
     approved: bool
+    workspace: str = ""
 
 
 class WorkspaceList(BaseModel):
@@ -171,6 +182,7 @@ class ConversationHistory(BaseModel):
     """Replayed scrollback for a resumed session, sent right after selection."""
     type: Literal["conversation_history"] = "conversation_history"
     messages: list[HistoryMessage] = []
+    workspace: str = ""
 
 
 # Union types for parsing

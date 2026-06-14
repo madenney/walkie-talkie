@@ -628,14 +628,15 @@ class ConnectionHandler:
                     history = []
                 if history:
                     await self.send_json(ConversationHistory(
-                        messages=[HistoryMessage(**m) for m in history]
+                        messages=[HistoryMessage(**m) for m in history],
+                        workspace=rt.name,
                     ))
 
             # The phone cleared this page before switching, so resend the current
             # turn's progress-so-far from the top and reset the cursor.
             rt.sent_len = 0
             if rt.is_responding and rt.display_accum:
-                await self.send_json(ResponseDelta(text=rt.display_accum))
+                await self.send_json(ResponseDelta(text=rt.display_accum, workspace=rt.name))
                 rt.sent_len = len(rt.display_accum)
 
         # Surface any approval that's been waiting in the background (its own

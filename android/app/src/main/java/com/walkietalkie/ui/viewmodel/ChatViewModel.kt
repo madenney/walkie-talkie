@@ -76,6 +76,7 @@ data class PendingApproval(
     val toolName: String,
     val summary: String,
     val detail: String,
+    val workspace: String = "",
 )
 
 data class ChatUiState(
@@ -90,8 +91,10 @@ data class ChatUiState(
     val serverUrl: String = BuildConfig.DEFAULT_SERVER_URL,
     val workspaces: List<Workspace> = emptyList(),
     val pauseMediaDuringTts: Boolean = false,
-    // Set when Claude wants to run a gated tool and is waiting for yes/no.
-    val pendingApproval: PendingApproval? = null,
+    // Pending tool approvals, keyed by the workspace they belong to — so an
+    // approval stays pinned to its own project's page instead of following you
+    // when you swipe to another. The overlay shows the active page's entry.
+    val pendingApprovals: Map<String, PendingApproval> = emptyMap(),
     // Live dashboard of every Claude session on the server (the "spinning
     // plates"), pushed by the server whenever any session's status changes.
     val sessionStatuses: List<SessionStatus> = emptyList(),
@@ -129,8 +132,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // 0 means no ping is in flight.
     private var pingSentAt = 0L
 
-    // Phone-side auto-deny timer for an outstanding approval prompt.
-    private var approvalTimeoutJob: Job? = null
+    // Phone-side auto-deny timers for outstanding approval prompts, keyed by the
+    // workspace each belongs to (approvals are per-project now).
+    private val approvalTimeoutJobs = mutableMapOf<String, Job>()
 
     init {
         audioPlayer.initialize()
@@ -207,14 +211,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         stopPushToTalk()
                         stopListening()
                     }
-                    // Drop the live dashboard: with no socket we can't know the
-                    // server's session state, so showing the last-known count/dots
-                    // would be misleading. (FCM, later, restores this while away.)
+                    // Drop the live dashboard + any pending approvals: with no
+                    // socket we can't know the server's state, so showing the
+                    // last-known count/dots/prompt would be misleading. (FCM, later,
+                    // restores awareness while away.)
+                    approvalTimeoutJobs.values.forEach { it.cancel() }
+                    approvalTimeoutJobs.clear()
                     _uiState.update {
                         it.copy(
                             sessionStatuses = emptyList(),
                             liveSessionCount = 0,
                             needsYouCount = 0,
+                            pendingApprovals = emptyMap(),
                         )
                     }
                     stopConnectionService()
@@ -606,12 +614,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleServerMessage(json: String) {
-        when (val msg = parseServerMessage(json)) {
+        val msg = parseServerMessage(json)
+        // The workspace currently on screen. A page-bound message tagged for any
+        // other workspace is a stale repaint for a project we've since swiped
+        // away from — drop it, or it lands in the wrong window.
+        val activeWs = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace }
+        fun mismatched(ws: String) = ws.isNotEmpty() && ws != activeWs
+
+        when (msg) {
             is ServerMessage.Transcription -> {
                 addUserMessage(msg.msg.text)
             }
 
             is ServerMessage.ResponseDelta -> {
+                if (mismatched(msg.msg.workspace)) return
                 updateActivePage { it.copy(isResponding = true) }
                 val id = streamingMessageId
                 if (id != null) {
@@ -628,6 +644,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is ServerMessage.ResponseEnd -> {
+                if (mismatched(msg.msg.workspace)) return
                 updateActivePage { it.copy(isResponding = false) }
                 streamingMessageId?.let { id ->
                     updateActiveMessage(id) { it.copy(isStreaming = false) }
@@ -636,6 +653,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is ServerMessage.ToolUse -> {
+                if (mismatched(msg.msg.workspace)) return
                 addMessage(ChatMessage(
                     role = Role.TOOL,
                     text = "Using ${msg.msg.toolName}...",
@@ -644,6 +662,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is ServerMessage.ToolResult -> {
+                if (mismatched(msg.msg.workspace)) return
                 val summary = if (msg.msg.success) "Done" else "Failed"
                 addMessage(ChatMessage(
                     role = Role.TOOL,
@@ -684,13 +703,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is ServerMessage.WorkspaceSelected -> {
-                addSystemMessage("Workspace: ${msg.msg.name}")
+                // Only the repaint for the page we're actually on (a stale one for
+                // a workspace we've swiped past would flip the wrong page's state).
+                if (mismatched(msg.msg.name)) return
                 // Reflect whether this workspace still has a turn running in the
                 // background, so the "Thinking…" indicator is right on switch-back.
                 updateActivePage { it.copy(isResponding = msg.msg.responding) }
             }
 
             is ServerMessage.ConversationHistory -> {
+                if (mismatched(msg.msg.workspace)) return
                 // Replayed scrollback for a resumed session — repaint the page so
                 // a continued conversation isn't visually blank on reopen.
                 val restored = msg.msg.messages.map { h ->
@@ -734,47 +756,47 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             is ServerMessage.PermissionRequest -> {
+                // Pin the approval to its own workspace so it shows only on that
+                // project's page (and stays put when you swipe elsewhere).
                 val m = msg.msg
-                approvalTimeoutJob?.cancel()
+                val ws = m.workspace
+                approvalTimeoutJobs.remove(ws)?.cancel()
                 _uiState.update {
-                    it.copy(pendingApproval = PendingApproval(m.id, m.toolName, m.summary, m.detail))
+                    it.copy(pendingApprovals = it.pendingApprovals +
+                        (ws to PendingApproval(m.id, m.toolName, m.summary, m.detail, ws)))
                 }
-                val line = if (m.detail.isNotBlank()) "${m.summary}: ${m.detail}" else m.summary
-                addSystemMessage("⚠️ Approval needed — $line")
-                startApprovalTimeout(m.id)
+                startApprovalTimeout(m.id, ws)
             }
             is ServerMessage.PermissionResolved -> {
-                // The approval settled server-side (often a spoken yes/no). Dismiss
-                // the prompt if it's still showing; the tap path already cleared it.
-                val pending = _uiState.value.pendingApproval
-                if (pending != null && pending.id == msg.msg.id) {
-                    approvalTimeoutJob?.cancel()
-                    addSystemMessage(if (msg.msg.approved) "Approved ✓" else "Denied ✗")
-                    _uiState.update { it.copy(pendingApproval = null) }
+                // Settled server-side (often a spoken yes/no). Dismiss whichever
+                // workspace's approval carries this id.
+                val entry = _uiState.value.pendingApprovals.entries.firstOrNull { it.value.id == msg.msg.id }
+                if (entry != null) {
+                    approvalTimeoutJobs.remove(entry.key)?.cancel()
+                    _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - entry.key) }
                 }
             }
             is ServerMessage.Unknown -> Log.w(TAG, "Unknown message type: ${msg.type}")
         }
     }
 
-    /** User tapped Approve/Deny on a pending tool-permission prompt. */
+    /** User tapped Approve/Deny on the on-screen project's pending prompt. */
     fun respondToApproval(approved: Boolean) {
-        val pending = _uiState.value.pendingApproval ?: return
-        approvalTimeoutJob?.cancel()
+        val ws = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace } ?: return
+        val pending = _uiState.value.pendingApprovals[ws] ?: return
+        approvalTimeoutJobs.remove(ws)?.cancel()
         wsClient.sendJson(PermissionResponseMsg(id = pending.id, approved = approved))
-        addSystemMessage(if (approved) "Approved ✓" else "Denied ✗")
-        _uiState.update { it.copy(pendingApproval = null) }
+        _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - ws) }
     }
 
     /** Auto-deny if the user doesn't respond, so a forgotten prompt can't hang. */
-    private fun startApprovalTimeout(id: String) {
-        approvalTimeoutJob?.cancel()
-        approvalTimeoutJob = viewModelScope.launch {
+    private fun startApprovalTimeout(id: String, ws: String) {
+        approvalTimeoutJobs.remove(ws)?.cancel()
+        approvalTimeoutJobs[ws] = viewModelScope.launch {
             delay(30_000)
-            if (_uiState.value.pendingApproval?.id == id) {
+            if (_uiState.value.pendingApprovals[ws]?.id == id) {
                 wsClient.sendJson(PermissionResponseMsg(id = id, approved = false))
-                addSystemMessage("Approval timed out — denied")
-                _uiState.update { it.copy(pendingApproval = null) }
+                _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - ws) }
             }
         }
     }

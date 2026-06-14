@@ -145,10 +145,14 @@ class WorkspacePool:
 
     # ----------------------------------------------------------------- send
     async def send(self, rt: WorkspaceRuntime, msg) -> None:
-        """Send one phone-bound message iff ``rt`` is the on-screen workspace."""
+        """Send one phone-bound message iff ``rt`` is the on-screen workspace.
+        Stamps the workspace so the phone can ignore anything not meant for the
+        page it's currently on."""
         async with self.lock:
             h = self.handler
             if h is not None and h.connected and self.active_name == rt.name:
+                if hasattr(msg, "workspace"):
+                    msg.workspace = rt.name
                 await h.send_json(msg)
 
     async def send_audio(self, rt: WorkspaceRuntime, data: bytes) -> None:
@@ -166,7 +170,7 @@ class WorkspacePool:
                 return
             new = rt.display_accum[rt.sent_len:]
             if new:
-                await h.send_json(ResponseDelta(text=new))
+                await h.send_json(ResponseDelta(text=new, workspace=rt.name))
                 rt.sent_len = len(rt.display_accum)
 
     # --------------------------------------------------------------- status
