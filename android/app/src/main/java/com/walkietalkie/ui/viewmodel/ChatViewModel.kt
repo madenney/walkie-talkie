@@ -7,6 +7,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
@@ -23,11 +24,18 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 
 private val Context.settingsStore by preferencesDataStore("settings")
 private val KEY_SERVER_URL = stringPreferencesKey("server_url")
 private val KEY_MUTED = booleanPreferencesKey("muted")
 private val KEY_PAUSE_MEDIA = booleanPreferencesKey("pause_media")
+// The "spinning plates": which workspaces were on which pages, so reopening the
+// app restores them (the server keeps each one running). JSON array of names in
+// page order, plus the page that was on screen.
+private val KEY_PAGES = stringPreferencesKey("pages")
+private val KEY_ACTIVE_PAGE = intPreferencesKey("active_page")
 
 private const val TAG = "ChatViewModel"
 
@@ -46,6 +54,13 @@ enum class Role { USER, ASSISTANT, TOOL, SYSTEM }
 data class Workspace(
     val name: String,
     val path: String,
+)
+
+/** Live status of one Claude session on the server, for the dashboard. */
+data class SessionStatus(
+    val name: String,
+    val responding: Boolean = false,
+    val blocked: Boolean = false,
 )
 
 data class ChatPage(
@@ -77,6 +92,13 @@ data class ChatUiState(
     val pauseMediaDuringTts: Boolean = false,
     // Set when Claude wants to run a gated tool and is waiting for yes/no.
     val pendingApproval: PendingApproval? = null,
+    // Live dashboard of every Claude session on the server (the "spinning
+    // plates"), pushed by the server whenever any session's status changes.
+    val sessionStatuses: List<SessionStatus> = emptyList(),
+    // All live sessions on the server (the notification badge number).
+    val liveSessionCount: Int = 0,
+    // How many sessions are blocked waiting on an approval from you.
+    val needsYouCount: Int = 0,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -134,6 +156,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val pauseMedia = prefs[KEY_PAUSE_MEDIA] ?: false
                 _uiState.update { it.copy(pauseMediaDuringTts = pauseMedia) }
                 audioPlayer.setPauseOtherApps(pauseMedia)
+
+                // Restore the spinning plates from last session BEFORE connecting,
+                // so the reconnect resync re-selects the right workspace (and the
+                // WorkspaceList handler won't override us with the Sandbox default).
+                // Messages are left empty; each page repaints when selected.
+                val savedPages = prefs[KEY_PAGES]
+                if (!savedPages.isNullOrBlank()) {
+                    val names = runCatching {
+                        WsJson.decodeFromString<List<String>>(savedPages)
+                    }.getOrDefault(emptyList())
+                    if (names.isNotEmpty()) {
+                        val restored = names.map { ChatPage(currentWorkspace = it) } + ChatPage()
+                        // Clamp to the last *real* page (not the blank sentinel),
+                        // so reopening doesn't land you on an empty new page.
+                        val idx = (prefs[KEY_ACTIVE_PAGE] ?: 0).coerceIn(0, names.lastIndex)
+                        _uiState.update { it.copy(pages = restored, activePageIndex = idx) }
+                    }
+                }
             }
             if (isServerUrlConfigured()) {
                 addSystemMessage("Starting up...")
@@ -152,6 +192,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     // Connected — show the notification (the badge means "connected").
                     startConnectionService()
                     addSystemMessage("Connected")
+                    // If we already had a workspace selected (a reconnect after a
+                    // drop/server-restart), re-select it so the server repaints its
+                    // scrollback + any turn that kept running while we were gone.
+                    // First-ever connect has no workspace yet — WorkspaceList will
+                    // auto-select the default instead.
+                    resyncActiveWorkspace()
                     // No auto-listen: the main screen is push-to-talk, so the mic
                     // only opens while the user holds the button. Ambient mode
                     // handles hands-free VAD listening on its own.
@@ -160,6 +206,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     if (wasConnected) {
                         stopPushToTalk()
                         stopListening()
+                    }
+                    // Drop the live dashboard: with no socket we can't know the
+                    // server's session state, so showing the last-known count/dots
+                    // would be misleading. (FCM, later, restores this while away.)
+                    _uiState.update {
+                        it.copy(
+                            sessionStatuses = emptyList(),
+                            liveSessionCount = 0,
+                            needsYouCount = 0,
+                        )
                     }
                     stopConnectionService()
                 }
@@ -214,7 +270,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     state.listeningState == VadState.LISTENING -> "Listening"
                     else -> "Connected"
                 }
-                WalkieTalkieService.instance?.updateNotification(status)
+                // The status-bar icon shows the live session count; the shade shows
+                // count + how many need an approval, with connection state as detail.
+                WalkieTalkieService.instance?.updateNotification(
+                    status = status,
+                    sessionCount = state.liveSessionCount,
+                    needsYou = state.needsYouCount,
+                )
             }
         }
     }
@@ -437,6 +499,45 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         streamingMessageId = null
         wsClient.sendJson(SelectWorkspaceMsg(name = name))
+        persistPages()
+    }
+
+    /** Save the spinning plates (each page's workspace + the on-screen page) so a
+     * reopen restores them. The work itself lives on the server (Part A); this is
+     * just the phone remembering which viewports to re-open. */
+    private fun persistPages() {
+        val state = _uiState.value
+        val names = state.pages.mapNotNull { it.currentWorkspace }
+        val active = state.activePageIndex
+        viewModelScope.launch {
+            getApplication<Application>().settingsStore.edit { prefs ->
+                prefs[KEY_PAGES] = WsJson.encodeToString(names)
+                prefs[KEY_ACTIVE_PAGE] = active
+            }
+        }
+    }
+
+    /**
+     * After a reconnect, re-select whatever workspace is on screen so the server
+     * repaints it. The server reset its "active workspace" when the old socket
+     * dropped, and any turn that kept running while we were gone has progress to
+     * replay. We clear the page's messages first so the server's repaint
+     * (scrollback + in-flight progress) is authoritative rather than doubling up
+     * with the stale bubbles from before the drop. No-op until a workspace has
+     * been chosen (first connect defers to WorkspaceList's auto-select).
+     */
+    private fun resyncActiveWorkspace() {
+        val state = _uiState.value
+        val page = state.pages.getOrNull(state.activePageIndex) ?: return
+        val ws = page.currentWorkspace ?: return
+        _uiState.update { s ->
+            val pages = s.pages.toMutableList()
+            val i = s.activePageIndex
+            pages[i] = pages[i].copy(messages = emptyList())
+            s.copy(pages = pages)
+        }
+        streamingMessageId = null
+        wsClient.sendJson(SelectWorkspaceMsg(name = ws))
     }
 
     fun onPageChanged(index: Int) {
@@ -444,20 +545,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (index == state.activePageIndex) return
         if (index !in state.pages.indices) return
 
-        // Cancel in-flight response on old page
-        val oldPage = state.pages[state.activePageIndex]
-        if (oldPage.isResponding) {
-            interrupt()
-        }
+        // Switching away does NOT interrupt the old workspace — it keeps running
+        // in the background on the server. Just stop local audio so its TTS
+        // doesn't bleed into the page we're moving to, and detach the streaming
+        // cursor so the new page's deltas land in a fresh bubble.
+        audioPlayer.stop()
         streamingMessageId = null
 
-        _uiState.update { it.copy(activePageIndex = index) }
-
-        // Switch workspace on server if new page has one
+        // Clear the target page's messages so the server's repaint (scrollback +
+        // any in-flight progress) is authoritative — otherwise a frozen partial
+        // bubble from before we swiped away would double up with the replay.
         val newPage = state.pages[index]
+        _uiState.update { s ->
+            val pages = s.pages.toMutableList()
+            if (newPage.currentWorkspace != null) {
+                pages[index] = pages[index].copy(messages = emptyList())
+            }
+            s.copy(pages = pages, activePageIndex = index)
+        }
+
+        // Tell the server which workspace is now on screen. It replays scrollback
+        // and any in-flight progress for that workspace (without interrupting it).
         if (newPage.currentWorkspace != null) {
             wsClient.sendJson(SelectWorkspaceMsg(name = newPage.currentWorkspace))
         }
+        persistPages()
     }
 
     private fun handleWsEvent(event: WsEvent) {
@@ -548,7 +660,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
             is ServerMessage.WorkspaceList -> {
                 val workspaces = msg.msg.workspaces.map { Workspace(it.name, it.path) }
-                _uiState.update { it.copy(workspaces = workspaces) }
+                val validNames = workspaces.map { it.name }.toSet()
+                _uiState.update { s ->
+                    // Drop restored pages whose workspace no longer exists on the
+                    // server (renamed/removed in config), keeping the trailing
+                    // blank sentinel so there's always somewhere to add a project.
+                    val kept = s.pages.filter {
+                        it.currentWorkspace == null || it.currentWorkspace in validNames
+                    }
+                    val pages = if (kept.any { it.currentWorkspace == null }) kept else kept + ChatPage()
+                    val active = s.activePageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                    s.copy(workspaces = workspaces, pages = pages, activePageIndex = active)
+                }
 
                 // On app open, default the active page to the Sandbox workspace
                 // (fall back to the first listed) if nothing is selected yet.
@@ -562,6 +685,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
             is ServerMessage.WorkspaceSelected -> {
                 addSystemMessage("Workspace: ${msg.msg.name}")
+                // Reflect whether this workspace still has a turn running in the
+                // background, so the "Thinking…" indicator is right on switch-back.
+                updateActivePage { it.copy(isResponding = msg.msg.responding) }
             }
 
             is ServerMessage.ConversationHistory -> {
@@ -583,6 +709,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (restored.isNotEmpty()) {
                     updateActivePage { it.copy(messages = restored) }
+                }
+            }
+
+            is ServerMessage.SessionsStatus -> {
+                val statuses = msg.msg.sessions.map {
+                    SessionStatus(name = it.name, responding = it.responding, blocked = it.blocked)
+                }
+                _uiState.update {
+                    it.copy(
+                        sessionStatuses = statuses,
+                        liveSessionCount = msg.msg.total,
+                        needsYouCount = msg.msg.needsYou,
+                    )
                 }
             }
 
@@ -680,24 +819,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 pages[i] = transform(pages[i])
             }
             state.copy(pages = pages)
-        }
-    }
-
-    private fun updatePage(index: Int, transform: (ChatPage) -> ChatPage) {
-        _uiState.update { state ->
-            val pages = state.pages.toMutableList()
-            if (index in pages.indices) {
-                pages[index] = transform(pages[index])
-            }
-            state.copy(pages = pages)
-        }
-    }
-
-    private fun updatePageMessage(pageIndex: Int, msgId: String, transform: (ChatMessage) -> ChatMessage) {
-        updatePage(pageIndex) { page ->
-            page.copy(messages = page.messages.map {
-                if (it.id == msgId) transform(it) else it
-            })
         }
     }
 

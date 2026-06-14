@@ -135,10 +135,28 @@ class WorkspaceList(BaseModel):
     workspaces: list[dict[str, str]]  # [{name, path}]
 
 
+class SessionStatusInfo(BaseModel):
+    """Live status of one workspace agent for the phone's dashboard."""
+    name: str
+    responding: bool = False  # a turn is actively running
+    blocked: bool = False     # waiting on a tool approval (needs the user)
+
+
+class SessionsStatus(BaseModel):
+    """Pushed whenever any workspace's status changes, so the phone can show a
+    live Shelf-style view of every running Claude session (independent of which
+    workspace is on screen)."""
+    type: Literal["sessions_status"] = "sessions_status"
+    sessions: list[SessionStatusInfo] = []
+    total: int = 0       # all live sessions (the notification badge number)
+    needs_you: int = 0   # how many are blocked on an approval
+
+
 class WorkspaceSelected(BaseModel):
     type: Literal["workspace_selected"] = "workspace_selected"
     name: str
     path: str
+    responding: bool = False  # a turn for this workspace is still running
 
 
 class HistoryMessage(BaseModel):
@@ -165,6 +183,7 @@ OutgoingMessage = (
     Transcription | ResponseDelta | ResponseEnd | ToolUse | ToolResult
     | TTSStart | TTSEnd | Error | Pong | WorkspaceList | WorkspaceSelected
     | PermissionRequest | PermissionResolved | ConversationHistory
+    | SessionsStatus
 )
 
 INCOMING_TYPES: dict[str, type[BaseModel]] = {

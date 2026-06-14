@@ -132,7 +132,9 @@ data class WorkspaceListMsg(
 data class WorkspaceSelectedMsg(
     val type: String,
     val name: String,
-    val path: String
+    val path: String,
+    // True if this workspace has a turn still running in the background.
+    val responding: Boolean = false
 )
 
 @Serializable
@@ -149,6 +151,21 @@ data class PermissionResolvedMsg(
     val type: String,
     val id: String,
     val approved: Boolean
+)
+
+@Serializable
+data class SessionStatusInfoMsg(
+    val name: String,
+    val responding: Boolean = false,
+    val blocked: Boolean = false,
+)
+
+@Serializable
+data class SessionsStatusMsg(
+    val type: String,
+    val sessions: List<SessionStatusInfoMsg> = emptyList(),
+    val total: Int = 0,
+    @SerialName("needs_you") val needsYou: Int = 0,
 )
 
 @Serializable
@@ -184,6 +201,7 @@ sealed class ServerMessage {
     data class PermissionRequest(val msg: PermissionRequestMsg) : ServerMessage()
     data class PermissionResolved(val msg: PermissionResolvedMsg) : ServerMessage()
     data class ConversationHistory(val msg: ConversationHistoryMsg) : ServerMessage()
+    data class SessionsStatus(val msg: SessionsStatusMsg) : ServerMessage()
     data class Unknown(val type: String) : ServerMessage()
 }
 
@@ -206,6 +224,7 @@ fun parseServerMessage(json: String): ServerMessage {
         "permission_request" -> ServerMessage.PermissionRequest(WsJson.decodeFromString(json))
         "permission_resolved" -> ServerMessage.PermissionResolved(WsJson.decodeFromString(json))
         "conversation_history" -> ServerMessage.ConversationHistory(WsJson.decodeFromString(json))
+        "sessions_status" -> ServerMessage.SessionsStatus(WsJson.decodeFromString(json))
         else -> ServerMessage.Unknown(type)
     }
 }

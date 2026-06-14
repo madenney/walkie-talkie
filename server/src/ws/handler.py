@@ -1,8 +1,15 @@
 """WebSocket endpoint and message routing.
 
-The Claude turn runs as a background task so the receive loop stays live during
+Each Claude turn runs as a background task so the receive loop stays live during
 a response — that's what lets a tool-permission request round-trip to the phone
 (and what makes barge-in interrupts responsive).
+
+A single connection keeps several workspaces alive at once: one
+``WorkspaceRuntime`` per workspace, each able to run its own turn concurrently.
+Only the *active* (on-screen) runtime streams text/audio to the phone; the others
+keep working in the background and persist to their SDK transcript, which is
+replayed when the user switches back. Switching workspaces never interrupts a
+running turn — only a new prompt or barge-in for that same workspace does.
 """
 
 from __future__ import annotations
@@ -50,7 +57,7 @@ from .protocol import (
     WorkspaceSelected,
     parse_incoming,
 )
-from .session import Session
+from .session import Session, WorkspacePool, WorkspaceRuntime
 
 if TYPE_CHECKING:
     from ..stt.base import STTEngine
@@ -69,6 +76,7 @@ class ConnectionHandler:
         self,
         ws: WebSocket,
         session: Session,
+        pool: WorkspacePool,
         settings: Settings,
         stt_engine: STTEngine | None = None,
         tts_engine: TTSEngine | None = None,
@@ -77,6 +85,10 @@ class ConnectionHandler:
     ) -> None:
         self.ws = ws
         self.session = session
+        # Shared, connection-independent pool of live workspace agents. Turns
+        # survive this connection going away; all phone-bound sends route through
+        # the pool so they reach whichever connection is attached now.
+        self.pool = pool
         self.settings = settings
         self.stt = stt_engine
         self.tts = tts_engine
@@ -88,9 +100,6 @@ class ConnectionHandler:
         self.model = settings.claude.model or None
 
         self._disconnected = False
-        self._response_task: asyncio.Task | None = None
-        # The current turn's TTS queue, so permission prompts can be spoken.
-        self._active_tts_queue: asyncio.Queue[str | None] | None = None
 
     # ------------------------------------------------------------------ sends
 
@@ -121,8 +130,11 @@ class ConnectionHandler:
         if not self._disconnected:
             self._disconnected = True
             log.info("Session %s client disconnected mid-send", self.session.session_id)
-        self.session.interrupted = True
-        self.session.deny_pending_approvals()
+        # Detach from the pool so background turns stop streaming to a dead
+        # socket — but DON'T interrupt them. They keep running; reconnecting
+        # re-attaches and repaints. This is what makes "closing the app doesn't
+        # interrupt the turns" hold.
+        self.pool.detach(self)
 
     # ------------------------------------------------------------------ loop
 
@@ -130,10 +142,19 @@ class ConnectionHandler:
         sid = self.session.session_id
         log.info("Session %s connected", sid)
 
+        # Become the live connection for the shared pool. Any workspace already
+        # running from a previous connection stays alive; the phone re-selects
+        # its on-screen workspace and we repaint it (see _activate_and_repaint).
+        self.pool.attach(self)
+
         if self.workspaces:
             await self.send_json(WorkspaceList(
                 workspaces=[{"name": w.name, "path": w.path} for w in self.workspaces.values()]
             ))
+
+        # Initial dashboard snapshot — on a reconnect this shows the sessions that
+        # kept running while the app was closed.
+        await self.pool.broadcast_status()
 
         try:
             while True:
@@ -152,17 +173,11 @@ class ConnectionHandler:
         except Exception:
             log.exception("Session %s error", sid)
         finally:
-            await self._teardown()
-            log.info("Session %s cleaned up", sid)
-
-    async def _teardown(self) -> None:
-        self.session.interrupted = True
-        self.session.deny_pending_approvals()
-        if self._response_task and not self._response_task.done():
-            self._response_task.cancel()
-        if self.session.agent is not None:
-            await self.session.agent.close()
-            self.session.agent = None
+            # Just detach — the workspace runtimes (and any in-flight turns)
+            # live on in the pool so they survive the app closing. The pool's
+            # idle reaper (and server shutdown) is what eventually closes agents.
+            self.pool.detach(self)
+            log.info("Session %s detached", sid)
 
     async def _handle_text(self, text: str) -> None:
         try:
@@ -193,7 +208,7 @@ class ConnectionHandler:
                 # message handling.
                 asyncio.create_task(self._handle_audio_end())
             case Interrupt():
-                await self._interrupt_current()
+                await self._interrupt_active()
             case PermissionResponse(id=pid, approved=approved):
                 self._resolve_approval(pid, approved)
 
@@ -206,50 +221,63 @@ class ConnectionHandler:
     # ---------------------------------------------------------------- turns
 
     async def _handle_user_input(self, text: str, image_note: str | None = None) -> None:
-        if self.session.agent is None:
+        rt = self.pool.active
+        if rt is None:
             await self.send_json(Error(
                 message="No workspace selected yet.", code="no_workspace"
             ))
             return
 
-        # If a tool is waiting on approval, treat this input as the yes/no answer
-        # (spoken or typed) rather than a new prompt — that's voice approval.
-        if self.session.pending_approvals:
+        # If a tool is waiting on approval in THIS workspace, treat this input as
+        # the yes/no answer (spoken or typed) rather than a new prompt.
+        if rt.pending_approvals:
             decision = _classify_yes_no(text)
             if decision is True:
-                self._resolve_all_approvals(True)
+                self._resolve_all_approvals(rt, True)
             elif decision is False:
-                self._resolve_all_approvals(False)
+                self._resolve_all_approvals(rt, False)
             else:
-                self._speak("Sorry, I didn't catch that. Say yes or no.")
+                self._speak(rt, "Sorry, I didn't catch that. Say yes or no.")
             return
 
-        # One turn at a time: interrupt any in-flight response first.
-        await self._interrupt_current()
+        # One turn at a time *per workspace*: interrupt only this workspace's
+        # in-flight response (other workspaces keep running).
+        await self._interrupt_runtime(rt)
 
         prompt = text if not image_note else f"{text}\n\n{image_note}"
-        self.session.interrupted = False
-        self.session.is_responding = True
-        self._response_task = asyncio.create_task(self._run_turn(prompt))
+        rt.interrupted = False
+        rt.is_responding = True
+        rt.touch()
+        rt.response_task = asyncio.create_task(self._run_turn(rt, prompt))
+        await self.pool.broadcast_status()
 
-    async def _run_turn(self, prompt: str) -> None:
-        """Run one Claude turn: stream text → TTS, surface tool calls."""
+    async def _run_turn(self, rt: WorkspaceRuntime, prompt: str) -> None:
+        """Run one Claude turn for ``rt``: stream text → TTS, surface tool calls.
+
+        Phone-bound output (deltas, tool cards, TTS) is emitted only while ``rt``
+        is the active workspace; otherwise the turn runs silently and persists to
+        the SDK transcript for replay on switch-back.
+        """
+        # Reset the repaint cursor under the lock so a concurrent activate/repaint
+        # can't read a half-reset state.
+        async with self.pool.lock:
+            rt.display_accum = ""
+            rt.sent_len = 0
         tts_buffer = ""
-        disp_buf = ""  # display-side buffer, holds back partial <speak> tags
         in_speak = False
         speak_accum = ""
         first_chunk_sent = False
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
         tts_task: asyncio.Task | None = None
         if self.tts:
-            tts_task = asyncio.create_task(self._tts_consumer(tts_queue))
-            self._active_tts_queue = tts_queue
+            tts_task = asyncio.create_task(self._tts_consumer(rt, tts_queue))
+            rt.tts_queue = tts_queue
 
         try:
-            await self.session.agent.query(prompt)
+            await rt.agent.query(prompt)
 
-            async for event in self.session.agent.stream():
-                if self.session.interrupted:
+            async for event in rt.agent.stream():
+                if rt.interrupted:
                     break
 
                 etype = event["type"]
@@ -258,8 +286,8 @@ class ConnectionHandler:
                     # Strip <speak> tags for display — robust to a tag split across
                     # deltas: remove complete tags, then hold back any trailing
                     # partial tag until the rest of it arrives.
-                    disp_buf += delta
-                    disp_buf = disp_buf.replace("<speak>", "").replace("</speak>", "")
+                    rt.disp_buf += delta
+                    disp_buf = rt.disp_buf.replace("<speak>", "").replace("</speak>", "")
                     hold = 0
                     for tag in ("<speak>", "</speak>"):
                         for k in range(len(tag) - 1, 0, -1):
@@ -270,8 +298,10 @@ class ConnectionHandler:
                         display, disp_buf = disp_buf[:-hold], disp_buf[-hold:]
                     else:
                         display, disp_buf = disp_buf, ""
+                    rt.disp_buf = disp_buf
                     if display:
-                        await self.send_json(ResponseDelta(text=display))
+                        rt.display_accum += display
+                        await self.pool.flush_delta(rt)
 
                     if self.tts:
                         tts_buffer += delta
@@ -327,14 +357,14 @@ class ConnectionHandler:
                             break
 
                 elif etype == "tool_use":
-                    await self.send_json(ToolUse(
+                    await self.pool.send(rt, ToolUse(
                         tool_name=event["tool_name"],
                         tool_id=event["tool_id"],
                         input=event.get("input", {}) or {},
                     ))
 
                 elif etype == "tool_result":
-                    await self.send_json(ToolResult(
+                    await self.pool.send(rt, ToolResult(
                         tool_id=event["tool_id"],
                         tool_name=event.get("tool_name", ""),
                         success=event["success"],
@@ -342,117 +372,175 @@ class ConnectionHandler:
                     ))
 
                 elif etype == "response_complete":
-                    self._persist_session_id()
+                    self._persist_session_id(rt)
 
         except asyncio.CancelledError:
-            log.info("Turn cancelled for session %s", self.session.session_id)
+            log.info("Turn cancelled for workspace %s", rt.name)
         except Exception as e:
-            log.exception("Turn error for session %s", self.session.session_id)
-            await self.send_json(Error(message=str(e), code="agent_error"))
+            log.exception("Turn error for workspace %s", rt.name)
+            await self.pool.send(rt, Error(message=str(e), code="agent_error"))
         finally:
-            await self.send_json(ResponseEnd())
+            await self.pool.send(rt, ResponseEnd())
             if tts_task:
                 await tts_queue.put(None)
                 try:
                     await tts_task
                 except Exception:
                     pass
-            self._active_tts_queue = None
-            self.session.is_responding = False
-            self._persist_session_id()
+            rt.tts_queue = None
+            rt.is_responding = False
+            rt.disp_buf = ""
+            rt.touch()
+            self._persist_session_id(rt)
+            await self.pool.broadcast_status()
 
-    def _persist_session_id(self) -> None:
+    def _persist_session_id(self, rt: WorkspaceRuntime) -> None:
         """Remember this workspace's SDK session id so it can be resumed later."""
         if not self.session_store:
             return
-        agent = self.session.agent
-        path = self.session.workspace_path
-        if agent and agent.session_id and path:
-            self.session_store.set(path, agent.session_id)
+        if rt.agent.session_id and rt.path:
+            self.session_store.set(rt.path, rt.agent.session_id)
 
-    async def _tts_consumer(self, queue: asyncio.Queue[str | None]) -> None:
+    async def _tts_consumer(self, rt: WorkspaceRuntime, queue: asyncio.Queue[str | None]) -> None:
         started = False
         try:
             while True:
                 text = await queue.get()
                 if text is None:
                     break
-                if self.session.interrupted:
+                # Only speak while this workspace is the one on screen.
+                if rt.interrupted or not self.pool.is_active(rt):
                     continue
                 if not started:
-                    await self.send_json(TTSStart())
+                    await self.pool.send(rt, TTSStart())
                     started = True
                 try:
                     async for chunk in self.tts.synthesize(text):
-                        if self.session.interrupted:
+                        if rt.interrupted or not self.pool.is_active(rt):
                             break
-                        await self.send_audio(chunk)
+                        await self.pool.send_audio(rt, chunk)
                 except Exception:
                     log.exception("TTS error")
                     break
-            if started:
-                await self.send_json(TTSEnd())
+            if started and self.pool.is_active(rt):
+                await self.pool.send(rt, TTSEnd())
         except (WebSocketDisconnect, RuntimeError):
             log.debug("TTS consumer: client disconnected")
 
-    async def _interrupt_current(self) -> None:
-        """Stop any in-flight turn (and unblock a hook waiting on approval)."""
-        task = self._response_task
-        self.session.interrupted = True
-        self.session.deny_pending_approvals()
-        if self.session.agent is not None:
-            await self.session.agent.interrupt()
+    async def _interrupt_active(self) -> None:
+        rt = self.pool.active
+        if rt is not None:
+            await self._interrupt_runtime(rt)
+
+    async def _interrupt_runtime(self, rt: WorkspaceRuntime) -> None:
+        """Stop ``rt``'s in-flight turn (and unblock a hook waiting on approval)."""
+        task = rt.response_task
+        rt.interrupted = True
+        rt.deny_pending_approvals()
+        try:
+            await rt.agent.interrupt()
+        except Exception:
+            log.exception("interrupt failed for %s", rt.name)
         if task is not None and not task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 task.cancel()
-        self._response_task = None
-        log.info("Session %s interrupted", self.session.session_id)
+        rt.response_task = None
+        log.info("Workspace %s interrupted", rt.name)
 
     # ----------------------------------------------------------- permissions
 
-    async def _request_permission(self, tool_name: str, tool_input: dict) -> bool:
-        """Hook callback: ask the phone for yes/no on a gated tool."""
+    def _make_permission_cb(self, name: str):
+        """Build the per-workspace permission callback bound to its name."""
+        async def _cb(tool_name: str, tool_input: dict) -> bool:
+            return await self._request_permission(name, tool_name, tool_input)
+        return _cb
+
+    async def _request_permission(self, name: str, tool_name: str, tool_input: dict) -> bool:
+        """Hook callback: ask the phone for yes/no on a gated tool.
+
+        If the workspace is backgrounded, the request waits silently and is
+        surfaced to the phone when the user switches to it.
+        """
+        rt = self.pool.runtimes.get(name)
+        if rt is None:
+            return False
         pid = uuid.uuid4().hex[:12]
         summary, detail, spoken = _describe_tool(tool_name, tool_input)
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
-        self.session.pending_approvals[pid] = fut
+        rt.pending_approvals[pid] = fut
+        rt.approval_meta[pid] = {
+            "tool_name": tool_name, "summary": summary, "detail": detail, "spoken": spoken,
+        }
+        # This workspace is now blocked on the user — reflect it on the dashboard
+        # even if it's a background session the phone isn't watching.
+        await self.pool.broadcast_status()
 
-        await self.send_json(PermissionRequest(
-            id=pid, tool_name=tool_name, summary=summary, detail=detail,
-        ))
-        self._speak(spoken)
+        if self.pool.is_active(rt):
+            await self._surface_approval(rt, pid)
 
         approved = False
         try:
-            approved = await asyncio.wait_for(fut, timeout=self.approval_timeout)
+            approved = await fut
             return approved
-        except asyncio.TimeoutError:
-            log.info("Approval %s timed out → deny", pid)
-            approved = False
-            return False
         finally:
-            self.session.pending_approvals.pop(pid, None)
-            # Tell the phone it's settled, however it was answered (voice/tap/timeout).
-            await self.send_json(PermissionResolved(id=pid, approved=approved))
+            rt.pending_approvals.pop(pid, None)
+            rt.approval_meta.pop(pid, None)
+            timer = rt.approval_timers.pop(pid, None)
+            if timer is not None:
+                timer.cancel()
+            was_surfaced = pid in rt.surfaced
+            rt.surfaced.discard(pid)
+            # Tell the phone it's settled, however it was answered (only if it
+            # was ever shown there).
+            if was_surfaced:
+                await self.pool.send(rt, PermissionResolved(id=pid, approved=approved))
+            # No longer blocked — refresh the dashboard.
+            await self.pool.broadcast_status()
+
+    async def _surface_approval(self, rt: WorkspaceRuntime, pid: str) -> None:
+        """Show a pending approval on the phone and start its auto-deny timer.
+        Only meaningful while ``rt`` is the on-screen workspace."""
+        if pid in rt.surfaced or not self.pool.is_active(rt):
+            return
+        meta = rt.approval_meta.get(pid)
+        if not meta:
+            return
+        rt.surfaced.add(pid)
+        await self.pool.send(rt, PermissionRequest(
+            id=pid, tool_name=meta["tool_name"],
+            summary=meta["summary"], detail=meta["detail"],
+        ))
+        self._speak(rt, meta["spoken"])
+        rt.approval_timers[pid] = asyncio.create_task(self._approval_timeout(rt, pid))
+
+    async def _approval_timeout(self, rt: WorkspaceRuntime, pid: str) -> None:
+        await asyncio.sleep(self.approval_timeout)
+        fut = rt.pending_approvals.get(pid)
+        if fut is not None and not fut.done():
+            log.info("Approval %s timed out → deny", pid)
+            fut.set_result(False)
 
     def _resolve_approval(self, pid: str, approved: bool) -> None:
-        fut = self.session.pending_approvals.get(pid)
-        if fut is not None and not fut.done():
-            fut.set_result(approved)
+        for rt in self.pool.runtimes.values():
+            fut = rt.pending_approvals.get(pid)
+            if fut is not None and not fut.done():
+                fut.set_result(approved)
+                return
 
-    def _resolve_all_approvals(self, approved: bool) -> None:
-        """Answer every outstanding approval (voice yes/no isn't tied to an id)."""
-        for fut in list(self.session.pending_approvals.values()):
+    def _resolve_all_approvals(self, rt: WorkspaceRuntime, approved: bool) -> None:
+        """Answer every outstanding approval in ``rt`` (voice yes/no isn't tied
+        to an id)."""
+        for fut in list(rt.pending_approvals.values()):
             if not fut.done():
                 fut.set_result(approved)
         log.info("Voice/text resolved approvals → %s", "approve" if approved else "deny")
 
-    def _speak(self, text: str) -> None:
-        q = self._active_tts_queue
-        if q is not None and text:
+    def _speak(self, rt: WorkspaceRuntime, text: str) -> None:
+        q = rt.tts_queue
+        if q is not None and text and self.pool.is_active(rt):
             try:
                 q.put_nowait(text)
             except Exception:
@@ -468,20 +556,21 @@ class ConnectionHandler:
             ))
             return
 
-        # Tear down any in-flight turn and the previous agent.
-        await self._interrupt_current()
-        if self.session.agent is not None:
-            await self.session.agent.close()
-            self.session.agent = None
+        # Already live (including surviving a previous connection)? Just bring it
+        # to the foreground and repaint — never interrupt it.
+        existing = self.pool.runtimes.get(name)
+        if existing is not None:
+            await self._activate_and_repaint(existing)
+            return
 
-        # Resume this workspace's prior conversation if we've seen one before.
+        # First time on this connection: spin up a fresh agent for it.
         resume_id = self.session_store.get(ws_config.path) if self.session_store else None
 
         async def _make_agent(resume: str | None) -> AgentSession:
             a = AgentSession(
                 cwd=ws_config.path,
                 gated_tools=self.gated_tools,
-                on_permission=self._request_permission,
+                on_permission=self._make_permission_cb(name),
                 model=self.model,
                 resume=resume,
             )
@@ -508,23 +597,51 @@ class ConnectionHandler:
                 await self.send_json(Error(message=f"Failed to start agent: {e}", code="agent_start"))
                 return
 
-        self.session.agent = agent
-        self.session.workspace_name = name
-        self.session.workspace_path = ws_config.path
+        rt = WorkspaceRuntime(name=name, path=ws_config.path, agent=agent)
+        self.pool.runtimes[name] = rt
         log.info("Session %s → workspace %s (%s)", self.session.session_id, name, ws_config.path)
-        await self.send_json(WorkspaceSelected(name=name, path=ws_config.path))
+        await self._activate_and_repaint(rt)
+        # A new live session exists now — update the dashboard.
+        await self.pool.broadcast_status()
 
-        # Replay prior scrollback so a resumed conversation isn't visually blank.
-        if agent.session_id:
-            try:
-                history = load_history(agent.session_id)
-            except Exception:
-                log.exception("Failed to load history for %s", agent.session_id)
-                history = []
-            if history:
-                await self.send_json(ConversationHistory(
-                    messages=[HistoryMessage(**m) for m in history]
-                ))
+    async def _activate_and_repaint(self, rt: WorkspaceRuntime) -> None:
+        """Bring ``rt`` on-screen: mark it active and replay scrollback + any
+        in-flight progress, atomically so a concurrent live turn can't interleave.
+
+        The whole thing runs under the pool's send lock: any in-flight turn for
+        ``rt`` blocks on the lock before it can send, so its first live delta
+        lands strictly after this repaint (and only the not-yet-sent suffix, via
+        the shared ``sent_len`` cursor). This is also the reconnect path — the
+        runtime may have been running the whole time the app was closed."""
+        async with self.pool.lock:
+            self.pool.active_name = rt.name
+            await self.send_json(WorkspaceSelected(
+                name=rt.name, path=rt.path, responding=rt.is_responding,
+            ))
+
+            # Persisted prior turns from the SDK transcript.
+            if rt.agent.session_id:
+                try:
+                    history = load_history(rt.agent.session_id)
+                except Exception:
+                    log.exception("Failed to load history for %s", rt.agent.session_id)
+                    history = []
+                if history:
+                    await self.send_json(ConversationHistory(
+                        messages=[HistoryMessage(**m) for m in history]
+                    ))
+
+            # The phone cleared this page before switching, so resend the current
+            # turn's progress-so-far from the top and reset the cursor.
+            rt.sent_len = 0
+            if rt.is_responding and rt.display_accum:
+                await self.send_json(ResponseDelta(text=rt.display_accum))
+                rt.sent_len = len(rt.display_accum)
+
+        # Surface any approval that's been waiting in the background (its own
+        # sends don't need the stream lock).
+        for pid in list(rt.pending_approvals.keys()):
+            await self._surface_approval(rt, pid)
 
     # ---------------------------------------------------------------- audio
 
@@ -551,12 +668,13 @@ class ConnectionHandler:
     async def _handle_image(self, msg: ImageMessage) -> None:
         """The SDK is text-only, so save the image into the workspace and tell the
         agent to Read it."""
-        if not self.session.workspace_path:
+        rt = self.pool.active
+        if rt is None:
             await self.send_json(Error(message="No workspace selected yet.", code="no_workspace"))
             return
         import base64
         ext = _IMG_EXT.get(msg.media_type, "jpg")
-        img_dir = Path(self.session.workspace_path) / ".walkie_images"
+        img_dir = Path(rt.path) / ".walkie_images"
         img_dir.mkdir(parents=True, exist_ok=True)
         img_path = img_dir / f"{int(time.time())}_{uuid.uuid4().hex[:6]}.{ext}"
         try:
@@ -605,12 +723,15 @@ def _classify_yes_no(text: str) -> bool | None:
 
 
 def _describe_tool(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str, str]:
-    """Return (summary, detail, spoken) for a permission prompt."""
+    """Return (summary, detail, spoken) for a permission prompt.
+
+    The spoken line is deliberately terse and never reads the command aloud —
+    on a hands-free interface that's noise. The command still shows on screen.
+    """
     if tool_name == "Bash":
         cmd = str(tool_input.get("command", "")).strip()
-        short = cmd if len(cmd) <= 200 else cmd[:200] + "…"
-        return ("Run a shell command", cmd, f"Claude wants to run a command: {short}. Approve?")
+        return ("Run a shell command", cmd, "Claude requires approval.")
     if tool_name in ("Write", "Edit", "MultiEdit"):
         path = tool_input.get("file_path") or tool_input.get("path") or "a file"
-        return (f"{tool_name} a file", str(path), f"Claude wants to edit {path}. Approve?")
-    return (f"Use {tool_name}", json.dumps(tool_input)[:200], f"Claude wants to use {tool_name}. Approve?")
+        return (f"{tool_name} a file", str(path), "Claude requires approval.")
+    return (f"Use {tool_name}", json.dumps(tool_input)[:200], "Claude requires approval.")

@@ -13,7 +13,7 @@ from pathlib import Path
 from .claude.session_store import SessionStore
 from .config import load_settings
 from .ws.handler import ConnectionHandler
-from .ws.session import Session, SessionRegistry
+from .ws.session import Session, SessionRegistry, WorkspacePool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +59,11 @@ else:
 
 sessions = SessionRegistry()
 
+# Live workspace agents, shared across connections so a running turn survives the
+# phone disconnecting (app closed / network blip). Reconnecting re-attaches and
+# repaints; turns are never interrupted by a connection going away.
+pool = WorkspacePool()
+
 # Per-workspace conversation continuity: remembers the last SDK session id for
 # each workspace so reopening the app (or restarting the server) resumes it.
 session_store = SessionStore(Path(__file__).parent.parent / ".wt_sessions.json")
@@ -67,8 +72,11 @@ session_store = SessionStore(Path(__file__).parent.parent / ".wt_sessions.json")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cleanup_task = sessions.start_cleanup()
+    reaper_task = pool.start_reaper()
     yield
     cleanup_task.cancel()
+    reaper_task.cancel()
+    await pool.close_all()
     sessions.clear()
 
 
@@ -89,10 +97,12 @@ async def health():
         "detail": (
             f"stt={'up' if stt_up else 'down'} "
             f"tts={'up' if tts_up else 'down'} · {len(sessions)} session(s)"
+            f" · {len(pool.runtimes)} live workspace(s)"
         ),
         "stt": stt_up,
         "tts": tts_up,
         "active_sessions": len(sessions),
+        "live_workspaces": len(pool.runtimes),
     }
 
 
@@ -104,6 +114,7 @@ async def websocket_endpoint(ws: WebSocket):
     handler = ConnectionHandler(
         ws=ws,
         session=session,
+        pool=pool,
         settings=settings,
         stt_engine=stt_engine,
         tts_engine=tts_engine,

@@ -31,6 +31,7 @@ import com.walkietalkie.ui.components.PushToTalkButton
 import com.walkietalkie.ui.viewmodel.ChatPage
 import com.walkietalkie.ui.viewmodel.ChatUiState
 import com.walkietalkie.ui.viewmodel.ChatViewModel
+import com.walkietalkie.ui.viewmodel.SessionStatus
 import com.walkietalkie.ui.viewmodel.Workspace
 
 @Composable
@@ -42,9 +43,20 @@ fun ChatScreen(
     val uiState by viewModel.uiState.collectAsState()
     val pagerState = rememberPagerState(pageCount = { uiState.pages.size })
 
-    // Sync settled page to ViewModel
+    // Sync settled page to ViewModel (a user swipe).
     LaunchedEffect(pagerState.settledPage) {
         viewModel.onPageChanged(pagerState.settledPage)
+    }
+
+    // Sync the other way: when the active page changes from the ViewModel side
+    // (e.g. restored from persistence on launch, which arrives asynchronously
+    // after first composition), move the pager to it. Guarded so it doesn't fight
+    // a user swipe (onPageChanged already no-ops when index == activePageIndex).
+    LaunchedEffect(uiState.activePageIndex) {
+        val target = uiState.activePageIndex
+        if (target in 0 until uiState.pages.size && pagerState.currentPage != target) {
+            pagerState.scrollToPage(target)
+        }
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -215,6 +227,7 @@ private fun ChatPageContent(
                         WorkspaceSelector(
                             workspaces = uiState.workspaces,
                             currentWorkspace = page.currentWorkspace,
+                            statuses = uiState.sessionStatuses,
                             onSelect = { viewModel.selectWorkspace(it) },
                         )
                     } else {
@@ -222,6 +235,14 @@ private fun ChatPageContent(
                     }
                 },
                 actions = {
+                    // Live count of running Claude sessions + how many need approval.
+                    if (uiState.liveSessionCount > 0) {
+                        SessionsChip(
+                            count = uiState.liveSessionCount,
+                            needsYou = uiState.needsYouCount,
+                        )
+                    }
+
                     // Ambient mode
                     IconButton(onClick = onNavigateToAmbient) {
                         Icon(Icons.Default.FiberManualRecord, contentDescription = "Ambient mode")
@@ -281,12 +302,18 @@ private fun ChatPageContent(
 private fun WorkspaceSelector(
     workspaces: List<Workspace>,
     currentWorkspace: String?,
+    statuses: List<SessionStatus>,
     onSelect: (String) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
+    val byName = remember(statuses) { statuses.associateBy { it.name } }
 
     Box {
         TextButton(onClick = { expanded = true }) {
+            // Status dot for the on-screen workspace, so you can see at a glance
+            // whether the project you're looking at is running / blocked.
+            StatusDot(byName[currentWorkspace])
+            Spacer(Modifier.width(6.dp))
             Text(
                 text = currentWorkspace ?: "Select project",
                 style = MaterialTheme.typography.titleMedium,
@@ -296,18 +323,35 @@ private fun WorkspaceSelector(
                 contentDescription = "Switch workspace",
             )
         }
+        // The dropdown doubles as the live dashboard: every project with a dot
+        // showing its server-side status (running / blocked / idle).
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
         ) {
             workspaces.forEach { ws ->
+                val status = byName[ws.name]
                 DropdownMenuItem(
-                    text = { Text(ws.name) },
+                    text = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            StatusDot(status)
+                            Spacer(Modifier.width(10.dp))
+                            Text(ws.name)
+                            if (status?.blocked == true) {
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    "needs you",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                        }
+                    },
                     onClick = {
                         expanded = false
                         onSelect(ws.name)
                     },
-                    leadingIcon = {
+                    trailingIcon = {
                         if (ws.name == currentWorkspace) {
                             Icon(Icons.Default.Check, contentDescription = null)
                         }
@@ -315,6 +359,46 @@ private fun WorkspaceSelector(
                 )
             }
         }
+    }
+}
+
+/** A small colored dot for a session's live status: red = blocked on approval,
+ * green = a turn is running, dim = idle/loaded, invisible = not a live session. */
+@Composable
+private fun StatusDot(status: SessionStatus?) {
+    val color = when {
+        status == null -> Color.Transparent
+        status.blocked -> MaterialTheme.colorScheme.error
+        status.responding -> Color(0xFF2ECC71)
+        else -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+    }
+    Box(
+        modifier = Modifier
+            .size(10.dp)
+            .clip(CircleShape)
+            .background(color)
+    )
+}
+
+/** Top-bar chip: live count of running sessions, with a warning tint + glyph when
+ * any are blocked waiting on you. */
+@Composable
+private fun SessionsChip(count: Int, needsYou: Int) {
+    val attention = needsYou > 0
+    val color = if (attention) MaterialTheme.colorScheme.error
+    else MaterialTheme.colorScheme.primary
+
+    Surface(
+        shape = MaterialTheme.shapes.small,
+        color = color.copy(alpha = 0.15f),
+        modifier = Modifier.padding(horizontal = 4.dp),
+    ) {
+        Text(
+            text = if (attention) "$count ⚠$needsYou" else "$count",
+            color = color,
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+        )
     }
 }
 
