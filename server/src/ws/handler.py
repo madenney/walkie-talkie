@@ -44,6 +44,7 @@ from .protocol import (
     PermissionResponse,
     Ping,
     Pong,
+    ReplayLast,
     ResponseDelta,
     ResponseEnd,
     SelectWorkspace,
@@ -100,6 +101,8 @@ class ConnectionHandler:
         self.model = settings.claude.model or None
 
         self._disconnected = False
+        # In-flight on-demand replay of a workspace's last spoken response.
+        self._replay_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ sends
 
@@ -211,6 +214,8 @@ class ConnectionHandler:
                 await self._interrupt_active()
             case PermissionResponse(id=pid, approved=approved):
                 self._resolve_approval(pid, approved)
+            case ReplayLast():
+                self._handle_replay_last()
 
     async def _handle_binary(self, data: bytes) -> None:
         if len(data) < 2:
@@ -267,6 +272,9 @@ class ConnectionHandler:
         in_speak = False
         speak_accum = ""
         first_chunk_sent = False
+        # The spoken phrases of this turn, kept so the phone can replay the
+        # response on demand (set into rt.last_spoken when the turn finishes).
+        turn_spoken: list[str] = []
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
         tts_task: asyncio.Task | None = None
         if self.tts:
@@ -323,6 +331,7 @@ class ConnectionHandler:
                                 remaining = speak_accum.strip()
                                 if remaining:
                                     await tts_queue.put(remaining)
+                                    turn_spoken.append(remaining)
                                 in_speak = False
                                 speak_accum = ""
                                 tts_buffer = tts_buffer[close_idx + 8:]
@@ -343,6 +352,7 @@ class ConnectionHandler:
                                     phrase = speak_accum[: m.end()].strip()
                                     if phrase:
                                         await tts_queue.put(phrase)
+                                        turn_spoken.append(phrase)
                                     speak_accum = speak_accum[m.end():]
                                     first_chunk_sent = True
                             else:
@@ -353,6 +363,7 @@ class ConnectionHandler:
                                     sentence = speak_accum[: m.end()].strip()
                                     if sentence:
                                         await tts_queue.put(sentence)
+                                        turn_spoken.append(sentence)
                                     speak_accum = speak_accum[m.end():]
                             break
 
@@ -390,6 +401,11 @@ class ConnectionHandler:
             rt.tts_queue = None
             rt.is_responding = False
             rt.disp_buf = ""
+            # Remember this turn's spoken text for on-demand replay (keep the prior
+            # one if this turn produced no speech, e.g. a tool-only turn).
+            joined = " ".join(turn_spoken).strip()
+            if joined:
+                rt.last_spoken = joined
             rt.touch()
             self._persist_session_id(rt)
             await self.pool.broadcast_status()
@@ -665,6 +681,30 @@ class ConnectionHandler:
             return
         await self.send_json(Transcription(text=text))
         await self._handle_user_input(text)
+
+    def _handle_replay_last(self) -> None:
+        """Speak the active workspace's last response again, on demand — lets the
+        user hear a reply that finished while they were on another project."""
+        rt = self.pool.active
+        if rt is None or not self.tts or not rt.last_spoken.strip():
+            return
+        if self._replay_task and not self._replay_task.done():
+            self._replay_task.cancel()
+        # Off the receive loop so synthesis can't block message handling.
+        self._replay_task = asyncio.create_task(self._stream_replay(rt, rt.last_spoken.strip()))
+
+    async def _stream_replay(self, rt: WorkspaceRuntime, text: str) -> None:
+        try:
+            await self.pool.send(rt, TTSStart())
+            async for chunk in self.tts.synthesize(text):
+                if not self.pool.is_active(rt):  # user swiped away — stop
+                    break
+                await self.pool.send_audio(rt, chunk)
+            await self.pool.send(rt, TTSEnd())
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Replay error for %s", rt.name)
 
     async def _handle_image(self, msg: ImageMessage) -> None:
         """The SDK is text-only, so save the image into the workspace and tell the

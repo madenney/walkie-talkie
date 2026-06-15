@@ -62,6 +62,10 @@ class WorkspaceRuntime:
     sent_len: int = 0
     # Scratch buffer holding back a partial <speak> tag split across deltas.
     disp_buf: str = ""
+    # The spoken (<speak>) text of the most recent completed turn, so the phone
+    # can replay it on demand — e.g. to hear a reply that finished while you were
+    # looking at another project.
+    last_spoken: str = ""
 
     # The current turn's TTS queue (so permission prompts can be spoken).
     tts_queue: "asyncio.Queue[str | None] | None" = field(default=None, repr=False)

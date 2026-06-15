@@ -63,6 +63,12 @@ class PermissionResponse(BaseModel):
     approved: bool
 
 
+class ReplayLast(BaseModel):
+    """Phone asks the server to speak the active workspace's last response again
+    (e.g. to hear a reply that arrived while you were on another project)."""
+    type: Literal["replay_last"] = "replay_last"
+
+
 # --- Server → Phone messages ---
 
 class Transcription(BaseModel):
@@ -188,7 +194,7 @@ class ConversationHistory(BaseModel):
 # Union types for parsing
 IncomingMessage = (
     AudioStart | AudioEnd | TextMessage | ImageMessage | Interrupt | Ping
-    | SelectWorkspace | PermissionResponse
+    | SelectWorkspace | PermissionResponse | ReplayLast
 )
 
 OutgoingMessage = (
@@ -207,6 +213,7 @@ INCOMING_TYPES: dict[str, type[BaseModel]] = {
     "ping": Ping,
     "select_workspace": SelectWorkspace,
     "permission_response": PermissionResponse,
+    "replay_last": ReplayLast,
 }
 
 

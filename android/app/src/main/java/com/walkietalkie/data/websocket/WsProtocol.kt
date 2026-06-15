@@ -62,6 +62,9 @@ data class PermissionResponseMsg(
     val approved: Boolean
 )
 
+@Serializable
+data class ReplayLastMsg(val type: String = "replay_last")
+
 // --- Incoming (server → phone) ---
 
 @Serializable

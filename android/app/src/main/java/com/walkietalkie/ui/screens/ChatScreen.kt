@@ -31,6 +31,7 @@ import com.walkietalkie.ui.components.PushToTalkButton
 import com.walkietalkie.ui.viewmodel.ChatPage
 import com.walkietalkie.ui.viewmodel.ChatUiState
 import com.walkietalkie.ui.viewmodel.ChatViewModel
+import com.walkietalkie.ui.viewmodel.Role
 import com.walkietalkie.ui.viewmodel.SessionStatus
 import com.walkietalkie.ui.viewmodel.Workspace
 
@@ -238,6 +239,14 @@ private fun ChatPageContent(
                     }
                 },
                 actions = {
+                    // Replay this project's last response as audio — e.g. to hear a
+                    // reply that finished while you were looking at another project.
+                    if (uiState.isConnected && page.messages.any { it.role == Role.ASSISTANT }) {
+                        IconButton(onClick = { viewModel.replayLastResponse() }) {
+                            Icon(Icons.Default.VolumeUp, contentDescription = "Play last response")
+                        }
+                    }
+
                     // Live count of running Claude sessions + how many need approval.
                     if (uiState.liveSessionCount > 0) {
                         SessionsChip(

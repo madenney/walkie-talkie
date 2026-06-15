@@ -780,6 +780,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Ask the server to speak the current project's last response again — for
+     * hearing a reply that finished while you were on another project. */
+    fun replayLastResponse() {
+        if (!_uiState.value.isConnected) return
+        wsClient.sendJson(ReplayLastMsg())
+    }
+
     /** User tapped Approve/Deny on the on-screen project's pending prompt. */
     fun respondToApproval(approved: Boolean) {
         val ws = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace } ?: return
