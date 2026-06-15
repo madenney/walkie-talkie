@@ -780,6 +780,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Close the on-screen project's live session: stops the agent server-side
+     * (frees the process, drops it from the running count) and removes the page.
+     * History is kept — reopening the project resumes where you left off. */
+    fun closeWorkspace() {
+        val state = _uiState.value
+        val idx = state.activePageIndex
+        val name = state.pages.getOrNull(idx)?.currentWorkspace ?: return
+        wsClient.sendJson(CloseWorkspaceMsg(name = name))
+        streamingMessageId = null
+        approvalTimeoutJobs.remove(name)?.cancel()
+        _uiState.update { s ->
+            val pages = s.pages.toMutableList()
+            if (idx in pages.indices) pages.removeAt(idx)
+            // Always keep a trailing blank "add a project" sentinel.
+            if (pages.none { it.currentWorkspace == null }) pages.add(ChatPage())
+            s.copy(
+                pages = pages,
+                activePageIndex = idx.coerceIn(0, pages.lastIndex),
+                pendingApprovals = s.pendingApprovals - name,
+            )
+        }
+        persistPages()
+    }
+
     /** Ask the server to speak the current project's last response again — for
      * hearing a reply that finished while you were on another project. */
     fun replayLastResponse() {

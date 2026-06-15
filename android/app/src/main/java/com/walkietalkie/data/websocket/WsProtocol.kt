@@ -65,6 +65,12 @@ data class PermissionResponseMsg(
 @Serializable
 data class ReplayLastMsg(val type: String = "replay_last")
 
+@Serializable
+data class CloseWorkspaceMsg(
+    val type: String = "close_workspace",
+    val name: String
+)
+
 // --- Incoming (server → phone) ---
 
 @Serializable

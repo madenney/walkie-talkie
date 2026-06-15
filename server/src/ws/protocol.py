@@ -69,6 +69,13 @@ class ReplayLast(BaseModel):
     type: Literal["replay_last"] = "replay_last"
 
 
+class CloseWorkspace(BaseModel):
+    """Stop a live session: close its agent and drop it from the pool. The
+    conversation transcript is kept, so reopening the project resumes it."""
+    type: Literal["close_workspace"] = "close_workspace"
+    name: str
+
+
 # --- Server → Phone messages ---
 
 class Transcription(BaseModel):
@@ -194,7 +201,7 @@ class ConversationHistory(BaseModel):
 # Union types for parsing
 IncomingMessage = (
     AudioStart | AudioEnd | TextMessage | ImageMessage | Interrupt | Ping
-    | SelectWorkspace | PermissionResponse | ReplayLast
+    | SelectWorkspace | PermissionResponse | ReplayLast | CloseWorkspace
 )
 
 OutgoingMessage = (
@@ -214,6 +221,7 @@ INCOMING_TYPES: dict[str, type[BaseModel]] = {
     "select_workspace": SelectWorkspace,
     "permission_response": PermissionResponse,
     "replay_last": ReplayLast,
+    "close_workspace": CloseWorkspace,
 }
 
 

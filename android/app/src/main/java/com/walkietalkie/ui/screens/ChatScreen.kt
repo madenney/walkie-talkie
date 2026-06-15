@@ -272,6 +272,30 @@ private fun ChatPageContent(
                     IconButton(onClick = onNavigateToSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
+
+                    // Overflow: close the on-screen project's live session (keeps
+                    // history; reopening resumes).
+                    if (page.currentWorkspace != null) {
+                        var menuOpen by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(onClick = { menuOpen = true }) {
+                                Icon(Icons.Default.MoreVert, contentDescription = "More")
+                            }
+                            DropdownMenu(
+                                expanded = menuOpen,
+                                onDismissRequest = { menuOpen = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Close session") },
+                                    leadingIcon = { Icon(Icons.Default.Close, contentDescription = null) },
+                                    onClick = {
+                                        menuOpen = false
+                                        viewModel.closeWorkspace()
+                                    },
+                                )
+                            }
+                        }
+                    }
                 }
             )
         },

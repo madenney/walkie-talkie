@@ -34,6 +34,7 @@ from .protocol import (
     AudioEnd,
     AudioPrefix,
     AudioStart,
+    CloseWorkspace,
     ConversationHistory,
     Error,
     HistoryMessage,
@@ -216,6 +217,10 @@ class ConnectionHandler:
                 self._resolve_approval(pid, approved)
             case ReplayLast():
                 self._handle_replay_last()
+            case CloseWorkspace(name=name):
+                # Off the receive loop: interrupt + agent teardown can take a few
+                # seconds and shouldn't freeze message handling.
+                asyncio.create_task(self._handle_close_workspace(name))
 
     async def _handle_binary(self, data: bytes) -> None:
         if len(data) < 2:
@@ -618,6 +623,23 @@ class ConnectionHandler:
         log.info("Session %s → workspace %s (%s)", self.session.session_id, name, ws_config.path)
         await self._activate_and_repaint(rt)
         # A new live session exists now — update the dashboard.
+        await self.pool.broadcast_status()
+
+    async def _handle_close_workspace(self, name: str) -> None:
+        """Stop a live session: interrupt any turn, close the agent, drop it from
+        the pool. The session id is kept in the store, so reopening resumes it."""
+        rt = self.pool.runtimes.get(name)
+        if rt is None:
+            return
+        await self._interrupt_runtime(rt)
+        try:
+            await rt.agent.close()
+        except Exception:
+            log.exception("Error closing agent for %s", name)
+        self.pool.runtimes.pop(name, None)
+        if self.pool.active_name == name:
+            self.pool.active_name = None
+        log.info("Closed workspace %s (transcript kept for resume)", name)
         await self.pool.broadcast_status()
 
     async def _activate_and_repaint(self, rt: WorkspaceRuntime) -> None:

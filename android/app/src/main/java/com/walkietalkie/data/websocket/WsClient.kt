@@ -128,6 +128,7 @@ class WsClient(
             is PingMsg -> WsJson.encodeToString(PingMsg.serializer(), msg)
             is PermissionResponseMsg -> WsJson.encodeToString(PermissionResponseMsg.serializer(), msg)
             is ReplayLastMsg -> WsJson.encodeToString(ReplayLastMsg.serializer(), msg)
+            is CloseWorkspaceMsg -> WsJson.encodeToString(CloseWorkspaceMsg.serializer(), msg)
             else -> return false
         }
         return sendText(json)
