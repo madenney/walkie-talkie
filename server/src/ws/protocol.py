@@ -130,6 +130,10 @@ class Error(BaseModel):
     type: Literal["error"] = "error"
     message: str
     code: str = "unknown"
+    # Stamped when sent for a specific workspace (via WorkspacePool.send) so a
+    # background agent's error doesn't pop on whatever page you're viewing.
+    # Connection-level errors (sent directly) leave this blank → always shown.
+    workspace: str = ""
 
 
 class Pong(BaseModel):

@@ -675,7 +675,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             is ServerMessage.TtsStart -> audioPlayer.onTtsStart()
             is ServerMessage.TtsEnd -> audioPlayer.onTtsEnd()
 
-            is ServerMessage.Error -> addSystemMessage("Error: ${msg.msg.message}")
+            is ServerMessage.Error -> {
+                if (mismatched(msg.msg.workspace)) return
+                addSystemMessage("Error: ${msg.msg.message}")
+            }
 
             is ServerMessage.WorkspaceList -> {
                 val workspaces = msg.msg.workspaces.map { Workspace(it.name, it.path) }
@@ -802,6 +805,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         persistPages()
+        // The page that slid into view wasn't re-selected (its index may be
+        // unchanged), so the server still has no active workspace after the close.
+        // Re-select it so it repaints (and its in-flight turn streams again).
+        resyncActiveWorkspace()
     }
 
     /** Ask the server to speak the current project's last response again — for

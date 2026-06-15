@@ -180,6 +180,7 @@ class ConnectionHandler:
             # Just detach — the workspace runtimes (and any in-flight turns)
             # live on in the pool so they survive the app closing. The pool's
             # idle reaper (and server shutdown) is what eventually closes agents.
+            self._cancel_replay()
             self.pool.detach(self)
             log.info("Session %s detached", sid)
 
@@ -231,6 +232,8 @@ class ConnectionHandler:
     # ---------------------------------------------------------------- turns
 
     async def _handle_user_input(self, text: str, image_note: str | None = None) -> None:
+        # New input — stop any replay so it can't talk over the turn's TTS.
+        self._cancel_replay()
         rt = self.pool.active
         if rt is None:
             await self.send_json(Error(
@@ -449,6 +452,7 @@ class ConnectionHandler:
             log.debug("TTS consumer: client disconnected")
 
     async def _interrupt_active(self) -> None:
+        self._cancel_replay()
         rt = self.pool.active
         if rt is not None:
             await self._interrupt_runtime(rt)
@@ -704,14 +708,19 @@ class ConnectionHandler:
         await self.send_json(Transcription(text=text))
         await self._handle_user_input(text)
 
+    def _cancel_replay(self) -> None:
+        """Stop an in-flight replay so its audio can't overlap a new turn's TTS."""
+        if self._replay_task and not self._replay_task.done():
+            self._replay_task.cancel()
+        self._replay_task = None
+
     def _handle_replay_last(self) -> None:
         """Speak the active workspace's last response again, on demand — lets the
         user hear a reply that finished while they were on another project."""
         rt = self.pool.active
         if rt is None or not self.tts or not rt.last_spoken.strip():
             return
-        if self._replay_task and not self._replay_task.done():
-            self._replay_task.cancel()
+        self._cancel_replay()
         # Off the receive loop so synthesis can't block message handling.
         self._replay_task = asyncio.create_task(self._stream_replay(rt, rt.last_spoken.strip()))
 

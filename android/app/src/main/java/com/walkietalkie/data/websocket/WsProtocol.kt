@@ -122,7 +122,8 @@ data class TtsEndMsg(val type: String)
 data class ErrorMsg(
     val type: String,
     val message: String,
-    val code: String = "unknown"
+    val code: String = "unknown",
+    val workspace: String = ""
 )
 
 @Serializable
