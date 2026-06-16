@@ -7,7 +7,6 @@ import android.net.Uri
 import android.util.Log
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
@@ -31,11 +30,9 @@ private val Context.settingsStore by preferencesDataStore("settings")
 private val KEY_SERVER_URL = stringPreferencesKey("server_url")
 private val KEY_MUTED = booleanPreferencesKey("muted")
 private val KEY_PAUSE_MEDIA = booleanPreferencesKey("pause_media")
-// The "spinning plates": which workspaces were on which pages, so reopening the
-// app restores them (the server keeps each one running). JSON array of names in
-// page order, plus the page that was on screen.
+// The "spinning plates": which projects are open, so reopening the app restores
+// them (the server keeps each one running). JSON array of workspace names.
 private val KEY_PAGES = stringPreferencesKey("pages")
-private val KEY_ACTIVE_PAGE = intPreferencesKey("active_page")
 
 private const val TAG = "ChatViewModel"
 
@@ -80,8 +77,14 @@ data class PendingApproval(
 )
 
 data class ChatUiState(
-    val pages: List<ChatPage> = listOf(ChatPage()),
+    // The open (live) sessions, one per page, swipeable once you're inside one.
+    // Empty until you open a project from the home list.
+    val pages: List<ChatPage> = emptyList(),
     val activePageIndex: Int = 0,
+    // True when the sessions list (home) is on screen rather than a conversation.
+    // Home is the landing screen and the live dashboard; tapping a project opens
+    // it into a session, the back arrow returns here.
+    val onHome: Boolean = true,
     val isConnected: Boolean = false,
     val isMuted: Boolean = false,
     // True while the user is holding the push-to-talk button (main screen).
@@ -161,21 +164,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(pauseMediaDuringTts = pauseMedia) }
                 audioPlayer.setPauseOtherApps(pauseMedia)
 
-                // Restore the spinning plates from last session BEFORE connecting,
-                // so the reconnect resync re-selects the right workspace (and the
-                // WorkspaceList handler won't override us with the Sandbox default).
-                // Messages are left empty; each page repaints when selected.
+                // Restore the spinning plates (the set of open sessions) from last
+                // run, so their live dots show on the home list right away. We land
+                // on home, not inside a session — the list is the orienting screen.
+                // Messages are left empty; a page repaints when you open it.
                 val savedPages = prefs[KEY_PAGES]
                 if (!savedPages.isNullOrBlank()) {
                     val names = runCatching {
                         WsJson.decodeFromString<List<String>>(savedPages)
                     }.getOrDefault(emptyList())
                     if (names.isNotEmpty()) {
-                        val restored = names.map { ChatPage(currentWorkspace = it) } + ChatPage()
-                        // Clamp to the last *real* page (not the blank sentinel),
-                        // so reopening doesn't land you on an empty new page.
-                        val idx = (prefs[KEY_ACTIVE_PAGE] ?: 0).coerceIn(0, names.lastIndex)
-                        _uiState.update { it.copy(pages = restored, activePageIndex = idx) }
+                        val restored = names.map { ChatPage(currentWorkspace = it) }
+                        _uiState.update { it.copy(pages = restored, onHome = true) }
                     }
                 }
             }
@@ -358,7 +358,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun onVadSpeechStart() {
         // If TTS is playing or server is responding, interrupt first
         val state = _uiState.value
-        if (state.isPlayingAudio || state.pages[state.activePageIndex].isResponding) {
+        val responding = state.pages.getOrNull(state.activePageIndex)?.isResponding == true
+        if (state.isPlayingAudio || responding) {
             interrupt(sendInterruptMsg = true)
         }
 
@@ -387,7 +388,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
         // Barge-in: pressing to talk while Claude is speaking/thinking interrupts it.
         val state = _uiState.value
-        if (state.isPlayingAudio || state.pages[state.activePageIndex].isResponding) {
+        val responding = state.pages.getOrNull(state.activePageIndex)?.isResponding == true
+        if (state.isPlayingAudio || responding) {
             interrupt(sendInterruptMsg = true)
         }
 
@@ -488,25 +490,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun selectWorkspace(name: String) {
-        val state = _uiState.value
-        val currentPage = state.pages[state.activePageIndex]
-        if (currentPage.currentWorkspace == name) return
-
+    /** Open a project from the home list (or focus it if it's already open) and
+     * enter its conversation. The server repaints scrollback + any in-flight turn
+     * that kept running in the background. */
+    fun openWorkspace(name: String) {
         _uiState.update { s ->
             val pages = s.pages.toMutableList()
-            val i = s.activePageIndex
-            pages[i] = pages[i].copy(currentWorkspace = name, messages = emptyList())
-
-            // Ensure a blank sentinel page at the end
-            if (i == pages.lastIndex) {
-                pages.add(ChatPage())
+            var idx = pages.indexOfFirst { it.currentWorkspace == name }
+            if (idx < 0) {
+                pages.add(ChatPage(currentWorkspace = name))
+                idx = pages.lastIndex
             }
-
-            s.copy(pages = pages)
+            // Keep any existing messages on screen; the server's repaint replaces
+            // them in place, so reopening never flashes empty before it loads.
+            s.copy(pages = pages, activePageIndex = idx, onHome = false)
         }
         streamingMessageId = null
         wsClient.sendJson(SelectWorkspaceMsg(name = name))
+        persistPages()
+    }
+
+    /** Leave the conversation and return to the sessions list. The session keeps
+     * running on the server but goes quiet (nothing streams) until reopened. */
+    fun goHome() {
+        if (_uiState.value.onHome) return
+        // Cut local audio so the session we're leaving doesn't keep talking at us
+        // on the list, and detach the streaming cursor.
+        audioPlayer.stop()
+        streamingMessageId = null
+        _uiState.update { it.copy(onHome = true) }
+        wsClient.sendJson(DeactivateMsg())
         persistPages()
     }
 
@@ -514,13 +527,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * reopen restores them. The work itself lives on the server (Part A); this is
      * just the phone remembering which viewports to re-open. */
     private fun persistPages() {
-        val state = _uiState.value
-        val names = state.pages.mapNotNull { it.currentWorkspace }
-        val active = state.activePageIndex
+        val names = _uiState.value.pages.mapNotNull { it.currentWorkspace }
         viewModelScope.launch {
             getApplication<Application>().settingsStore.edit { prefs ->
                 prefs[KEY_PAGES] = WsJson.encodeToString(names)
-                prefs[KEY_ACTIVE_PAGE] = active
             }
         }
     }
@@ -536,20 +546,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun resyncActiveWorkspace() {
         val state = _uiState.value
+        // On the home list nothing is selected — stay deactivated until the user
+        // opens a project.
+        if (state.onHome) return
         val page = state.pages.getOrNull(state.activePageIndex) ?: return
         val ws = page.currentWorkspace ?: return
-        _uiState.update { s ->
-            val pages = s.pages.toMutableList()
-            val i = s.activePageIndex
-            pages[i] = pages[i].copy(messages = emptyList())
-            s.copy(pages = pages)
-        }
+        // Leave the page's messages up; the server repaint replaces them in place.
         streamingMessageId = null
         wsClient.sendJson(SelectWorkspaceMsg(name = ws))
     }
 
+    /** A swipe between open sessions inside the conversation view. */
     fun onPageChanged(index: Int) {
         val state = _uiState.value
+        if (state.onHome) return
         if (index == state.activePageIndex) return
         if (index !in state.pages.indices) return
 
@@ -560,23 +570,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         audioPlayer.stop()
         streamingMessageId = null
 
-        // Clear the target page's messages so the server's repaint (scrollback +
-        // any in-flight progress) is authoritative — otherwise a frozen partial
-        // bubble from before we swiped away would double up with the replay.
-        val newPage = state.pages[index]
-        _uiState.update { s ->
-            val pages = s.pages.toMutableList()
-            if (newPage.currentWorkspace != null) {
-                pages[index] = pages[index].copy(messages = emptyList())
-            }
-            s.copy(pages = pages, activePageIndex = index)
-        }
+        // Keep the page's current messages on screen; the server's repaint
+        // (ConversationHistory, sent on selection) replaces them in place. Not
+        // blanking first means flipping to an already-open project shows its chat
+        // continuously rather than flashing empty for a frame before it repaints.
+        val ws = state.pages[index].currentWorkspace
+        _uiState.update { it.copy(activePageIndex = index) }
 
         // Tell the server which workspace is now on screen. It replays scrollback
         // and any in-flight progress for that workspace (without interrupting it).
-        if (newPage.currentWorkspace != null) {
-            wsClient.sendJson(SelectWorkspaceMsg(name = newPage.currentWorkspace))
-        }
+        ws?.let { wsClient.sendJson(SelectWorkspaceMsg(name = it)) }
         persistPages()
     }
 
@@ -615,10 +618,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun handleServerMessage(json: String) {
         val msg = parseServerMessage(json)
-        // The workspace currently on screen. A page-bound message tagged for any
-        // other workspace is a stale repaint for a project we've since swiped
-        // away from — drop it, or it lands in the wrong window.
-        val activeWs = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace }
+        // The workspace currently on screen (null when we're on the home list).
+        // A page-bound message tagged for any other workspace is a stale repaint
+        // for a project we're not looking at — drop it, or it lands in the wrong
+        // window (or paints under the home list).
+        val activeWs = _uiState.value.run {
+            if (onHome) null else pages.getOrNull(activePageIndex)?.currentWorkspace
+        }
         fun mismatched(ws: String) = ws.isNotEmpty() && ws != activeWs
 
         when (msg) {
@@ -684,25 +690,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val workspaces = msg.msg.workspaces.map { Workspace(it.name, it.path) }
                 val validNames = workspaces.map { it.name }.toSet()
                 _uiState.update { s ->
-                    // Drop restored pages whose workspace no longer exists on the
-                    // server (renamed/removed in config), keeping the trailing
-                    // blank sentinel so there's always somewhere to add a project.
-                    val kept = s.pages.filter {
-                        it.currentWorkspace == null || it.currentWorkspace in validNames
-                    }
-                    val pages = if (kept.any { it.currentWorkspace == null }) kept else kept + ChatPage()
-                    val active = s.activePageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
-                    s.copy(workspaces = workspaces, pages = pages, activePageIndex = active)
+                    // Drop any restored open sessions whose workspace no longer
+                    // exists on the server (renamed/removed in config).
+                    val kept = s.pages.filter { it.currentWorkspace in validNames }
+                    val active = s.activePageIndex.coerceIn(0, (kept.size - 1).coerceAtLeast(0))
+                    s.copy(
+                        workspaces = workspaces,
+                        pages = kept,
+                        activePageIndex = active,
+                        // If everything we had open is gone, fall back to the list.
+                        onHome = if (kept.isEmpty()) true else s.onHome,
+                    )
                 }
-
-                // On app open, default the active page to the Sandbox workspace
-                // (fall back to the first listed) if nothing is selected yet.
-                val active = _uiState.value.run { pages.getOrNull(activePageIndex) }
-                if (active?.currentWorkspace == null && workspaces.isNotEmpty()) {
-                    val default = workspaces.firstOrNull { it.name.equals("Sandbox", ignoreCase = true) }
-                        ?: workspaces.first()
-                    selectWorkspace(default.name)
-                }
+                // No auto-select: the home list is the landing screen. The user
+                // picks which project to open.
             }
 
             is ServerMessage.WorkspaceSelected -> {
@@ -718,7 +719,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (mismatched(msg.msg.workspace)) return
                 // Replayed scrollback for a resumed session — repaint the page so
                 // a continued conversation isn't visually blank on reopen.
-                val restored = msg.msg.messages.map { h ->
+                val restored = msg.msg.messages.mapIndexed { i, h ->
                     val role = when (h.role) {
                         "user" -> Role.USER
                         "assistant" -> Role.ASSISTANT
@@ -726,6 +727,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         else -> Role.SYSTEM
                     }
                     ChatMessage(
+                        // Stable, position-based id so re-painting the SAME
+                        // scrollback (which happens on every flip to an already-open
+                        // project) yields identical list keys. Otherwise each
+                        // ChatMessage gets a fresh random id, the LazyColumn sees all
+                        // keys change, and it tears down + rebuilds every row — the
+                        // blink that showed ~half a second after each swipe.
+                        id = "hist-$i",
                         role = role,
                         text = h.text,
                         toolName = h.toolName,
@@ -786,29 +794,45 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** Close the on-screen project's live session: stops the agent server-side
      * (frees the process, drops it from the running count) and removes the page.
      * History is kept — reopening the project resumes where you left off. */
+    /** Close the session on screen (from the session view's overflow), then
+     * settle the view: drop to the list if nothing's left, else repaint whatever
+     * page slid in. History is kept — reopening resumes. */
     fun closeWorkspace() {
-        val state = _uiState.value
-        val idx = state.activePageIndex
-        val name = state.pages.getOrNull(idx)?.currentWorkspace ?: return
-        wsClient.sendJson(CloseWorkspaceMsg(name = name))
+        val name = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace } ?: return
         streamingMessageId = null
+        closeWorkspace(name)
+        if (_uiState.value.onHome) {
+            // Nothing left on screen — make sure the server stops streaming too.
+            wsClient.sendJson(DeactivateMsg())
+        } else {
+            // A different open session slid into view; re-select it so it repaints
+            // (and its in-flight turn streams again).
+            resyncActiveWorkspace()
+        }
+    }
+
+    /** Close a session by name — e.g. straight from the home list's "Currently
+     * open" section. Stops the agent server-side and drops its page; the
+     * conversation transcript is kept so reopening resumes it. */
+    fun closeWorkspace(name: String) {
+        wsClient.sendJson(CloseWorkspaceMsg(name = name))
         approvalTimeoutJobs.remove(name)?.cancel()
         _uiState.update { s ->
+            val idx = s.pages.indexOfFirst { it.currentWorkspace == name }
             val pages = s.pages.toMutableList()
-            if (idx in pages.indices) pages.removeAt(idx)
-            // Always keep a trailing blank "add a project" sentinel.
-            if (pages.none { it.currentWorkspace == null }) pages.add(ChatPage())
+            if (idx >= 0) pages.removeAt(idx)
+            // Keep the active page index valid if we removed something before it.
+            val active = s.activePageIndex
+                .let { if (idx in 0 until it) it - 1 else it }
+                .coerceIn(0, (pages.size - 1).coerceAtLeast(0))
             s.copy(
                 pages = pages,
-                activePageIndex = idx.coerceIn(0, pages.lastIndex),
+                activePageIndex = active,
+                onHome = if (pages.isEmpty()) true else s.onHome,
                 pendingApprovals = s.pendingApprovals - name,
             )
         }
         persistPages()
-        // The page that slid into view wasn't re-selected (its index may be
-        // unchanged), so the server still has no active workspace after the close.
-        // Re-select it so it repaints (and its in-flight turn streams again).
-        resyncActiveWorkspace()
     }
 
     /** Ask the server to speak the current project's last response again — for

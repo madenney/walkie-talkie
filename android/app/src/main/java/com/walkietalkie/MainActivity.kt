@@ -13,6 +13,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
@@ -20,8 +23,16 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.walkietalkie.ui.screens.AmbientScreen
 import com.walkietalkie.ui.screens.ChatScreen
+import com.walkietalkie.ui.screens.FilesScreen
 import com.walkietalkie.ui.screens.SettingsScreen
 import com.walkietalkie.ui.viewmodel.ChatViewModel
+
+/** Turn the configured ws:// URL into the http:// origin the file API lives on. */
+private fun httpBase(wsUrl: String): String = wsUrl
+    .replace("wss://", "https://")
+    .replace("ws://", "http://")
+    .removeSuffix("/ws")
+    .trimEnd('/')
 
 class MainActivity : ComponentActivity() {
 
@@ -66,6 +77,17 @@ class MainActivity : ComponentActivity() {
                                 onNavigateToAmbient = {
                                     navController.navigate("ambient")
                                 },
+                                onNavigateToFiles = {
+                                    navController.navigate("files")
+                                },
+                            )
+                        }
+                        composable("files") {
+                            val uiState by chatViewModel.uiState.collectAsState()
+                            val base = remember(uiState.serverUrl) { httpBase(uiState.serverUrl) }
+                            FilesScreen(
+                                serverBaseUrl = base,
+                                onBack = { navController.popBackStack() },
                             )
                         }
                         composable("settings") {

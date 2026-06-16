@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Files downloaded for "open with" live in the app cache. -->
+    <cache-path name="cache" path="." />
+</paths>

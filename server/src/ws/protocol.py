@@ -76,6 +76,13 @@ class CloseWorkspace(BaseModel):
     name: str
 
 
+class Deactivate(BaseModel):
+    """Phone moved to the home/sessions list — no workspace is on screen. Every
+    workspace keeps running in the background, but the server streams nothing
+    (no text, no TTS) until the phone selects a workspace again."""
+    type: Literal["deactivate"] = "deactivate"
+
+
 # --- Server → Phone messages ---
 
 class Transcription(BaseModel):
@@ -206,6 +213,7 @@ class ConversationHistory(BaseModel):
 IncomingMessage = (
     AudioStart | AudioEnd | TextMessage | ImageMessage | Interrupt | Ping
     | SelectWorkspace | PermissionResponse | ReplayLast | CloseWorkspace
+    | Deactivate
 )
 
 OutgoingMessage = (
@@ -226,6 +234,7 @@ INCOMING_TYPES: dict[str, type[BaseModel]] = {
     "permission_response": PermissionResponse,
     "replay_last": ReplayLast,
     "close_workspace": CloseWorkspace,
+    "deactivate": Deactivate,
 }
 
 

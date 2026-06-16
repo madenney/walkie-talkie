@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .claude.session_store import SessionStore
 from .config import load_settings
+from .fs_browser import make_fs_router
 from .ws.handler import ConnectionHandler
 from .ws.session import Session, SessionRegistry, WorkspacePool
 
@@ -81,6 +82,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Walkie Talkie", version="0.1.0", lifespan=lifespan)
+
+# Read-only file explorer for the phone, scoped to the workspace folders.
+app.include_router(make_fs_router(settings))
 
 
 @app.get("/health")

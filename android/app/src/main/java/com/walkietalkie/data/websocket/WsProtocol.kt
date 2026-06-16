@@ -71,6 +71,9 @@ data class CloseWorkspaceMsg(
     val name: String
 )
 
+@Serializable
+data class DeactivateMsg(val type: String = "deactivate")
+
 // --- Incoming (server → phone) ---
 
 @Serializable

@@ -36,6 +36,7 @@ from .protocol import (
     AudioStart,
     CloseWorkspace,
     ConversationHistory,
+    Deactivate,
     Error,
     HistoryMessage,
     ImageMessage,
@@ -200,6 +201,10 @@ class ConnectionHandler:
                 await self.send_json(Pong())
             case SelectWorkspace(name=name):
                 await self._handle_select_workspace(name)
+            case Deactivate():
+                # Phone went to the home list — keep every workspace running but
+                # stop streaming to a screen that isn't showing one.
+                self.pool.active_name = None
             case TextMessage(text=user_text):
                 await self._handle_user_input(user_text)
             case ImageMessage():
