@@ -17,6 +17,14 @@ import kotlinx.coroutines.flow.StateFlow
 private const val TAG = "AudioPlayer"
 
 /**
+ * Lifecycle of one spoken response, distinct from [AudioPlayer.isPlaying]
+ * (which flickers on buffer underruns). This stays stable: it only leaves
+ * PLAYING when the user pauses, the stream ends, or playback is stopped — so
+ * the UI can keep a bubble highlighted across mid-stream buffering gaps.
+ */
+enum class PlaybackState { IDLE, PLAYING, PAUSED, ENDED }
+
+/**
  * Streams MP3 audio from the server via ExoPlayer.
  *
  * Uses [StreamingDataSource] as a pipe: chunks fed from the WebSocket
@@ -30,6 +38,11 @@ class AudioPlayer(private val context: Context) {
 
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying
+
+    // Coarse lifecycle of the current utterance, used to drive the "speaking"
+    // highlight and the tap-to-pause affordance on the message bubble.
+    private val _playback = MutableStateFlow(PlaybackState.IDLE)
+    val playback: StateFlow<PlaybackState> = _playback
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -55,13 +68,20 @@ class AudioPlayer(private val context: Context) {
                     _isPlaying.value = state == Player.STATE_READY && isPlaying
                     if (state == Player.STATE_ENDED) {
                         _isPlaying.value = false
+                        // Natural end of the utterance — drop the highlight.
+                        _playback.value = PlaybackState.ENDED
                         abandonAudioFocus()
                     }
                 }
 
                 override fun onIsPlayingChanged(isPlayingNow: Boolean) {
                     _isPlaying.value = isPlayingNow
-                    if (!isPlayingNow) {
+                    // Only PROMOTE to PLAYING here; never infer pause/end from a
+                    // false (that also fires on buffer underruns mid-stream).
+                    // PAUSED/ENDED/IDLE are set explicitly by pause()/stop()/ENDED.
+                    if (isPlayingNow) {
+                        _playback.value = PlaybackState.PLAYING
+                    } else {
                         abandonAudioFocus()
                     }
                 }
@@ -128,7 +148,38 @@ class AudioPlayer(private val context: Context) {
         p.setMediaSource(mediaSource)
         p.prepare()
         p.play()
+        // Mark PLAYING up front so the speaking-highlight shows immediately,
+        // even before the first frame has buffered enough to actually sound.
+        _playback.value = PlaybackState.PLAYING
         Log.d(TAG, "Streaming playback started")
+    }
+
+    /** Pause the current utterance, keeping buffered audio so it can resume. */
+    fun pause() {
+        val p = player ?: return
+        if (_playback.value == PlaybackState.PLAYING) {
+            p.pause()
+            _playback.value = PlaybackState.PAUSED
+        }
+    }
+
+    /** Resume a paused utterance from where it left off. */
+    fun resume() {
+        val p = player ?: return
+        if (_playback.value == PlaybackState.PAUSED) {
+            requestAudioFocus()
+            p.play()
+            _playback.value = PlaybackState.PLAYING
+        }
+    }
+
+    /** Toggle pause/resume — what a tap on the speaking bubble does. */
+    fun togglePause() {
+        when (_playback.value) {
+            PlaybackState.PLAYING -> pause()
+            PlaybackState.PAUSED -> resume()
+            else -> {}
+        }
     }
 
     fun onTtsChunk(data: ByteArray) {
@@ -145,6 +196,7 @@ class AudioPlayer(private val context: Context) {
         streamingSource?.close()
         streamingSource = null
         _isPlaying.value = false
+        _playback.value = PlaybackState.IDLE
         abandonAudioFocus()
     }
 
@@ -155,5 +207,6 @@ class AudioPlayer(private val context: Context) {
         streamingSource?.close()
         streamingSource = null
         _isPlaying.value = false
+        _playback.value = PlaybackState.IDLE
     }
 }

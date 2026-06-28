@@ -4,6 +4,10 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
@@ -14,6 +18,7 @@ import androidx.lifecycle.viewModelScope
 import com.walkietalkie.BuildConfig
 import com.walkietalkie.audio.AudioCapture
 import com.walkietalkie.audio.AudioPlayer
+import com.walkietalkie.audio.PlaybackState
 import com.walkietalkie.audio.VadState
 import com.walkietalkie.audio.VoiceActivityDetector
 import com.walkietalkie.camera.ImageCapture
@@ -91,6 +96,11 @@ data class ChatUiState(
     val isRecording: Boolean = false,
     val listeningState: VadState = VadState.IDLE,
     val isPlayingAudio: Boolean = false,
+    // The assistant message currently being spoken aloud (null when nothing is).
+    // Its bubble shows an animated highlight and is tappable to pause/resume.
+    val speakingMessageId: String? = null,
+    // Whether that spoken response is paused (the user tapped the bubble).
+    val audioPaused: Boolean = false,
     val serverUrl: String = BuildConfig.DEFAULT_SERVER_URL,
     val workspaces: List<Workspace> = emptyList(),
     val pauseMediaDuringTts: Boolean = false,
@@ -261,6 +271,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // Drive the speaking-bubble highlight from the (stable) playback lifecycle.
+        // PLAYING/PAUSED keep the highlight up (paused just flips the affordance);
+        // IDLE/ENDED drop it. speakingMessageId itself is set when TTS begins.
+        viewModelScope.launch {
+            audioPlayer.playback.collect { st ->
+                _uiState.update {
+                    when (st) {
+                        PlaybackState.PLAYING -> it.copy(audioPaused = false)
+                        PlaybackState.PAUSED -> it.copy(audioPaused = true)
+                        PlaybackState.IDLE, PlaybackState.ENDED ->
+                            it.copy(speakingMessageId = null, audioPaused = false)
+                    }
+                }
+            }
+        }
+
         // Update foreground service notification with current status
         viewModelScope.launch {
             uiState.collect { state ->
@@ -356,10 +382,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun onVadSpeechStart() {
-        // If TTS is playing or server is responding, interrupt first
+        // If TTS is playing/paused or the server is responding, interrupt first.
         val state = _uiState.value
         val responding = state.pages.getOrNull(state.activePageIndex)?.isResponding == true
-        if (state.isPlayingAudio || responding) {
+        if (state.isPlayingAudio || state.speakingMessageId != null || responding) {
             interrupt(sendInterruptMsg = true)
         }
 
@@ -386,10 +412,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun startPushToTalk() {
         if (!_uiState.value.isConnected || _uiState.value.isRecording) return
 
-        // Barge-in: pressing to talk while Claude is speaking/thinking interrupts it.
+        // Barge-in: pressing to talk while Claude is speaking/paused/thinking
+        // interrupts it (a paused utterance has no live audio but is still "open").
         val state = _uiState.value
         val responding = state.pages.getOrNull(state.activePageIndex)?.isResponding == true
-        if (state.isPlayingAudio || responding) {
+        if (state.isPlayingAudio || state.speakingMessageId != null || responding) {
             interrupt(sendInterruptMsg = true)
         }
 
@@ -678,7 +705,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ))
             }
 
-            is ServerMessage.TtsStart -> audioPlayer.onTtsStart()
+            is ServerMessage.TtsStart -> {
+                audioPlayer.onTtsStart()
+                // Mark which bubble is being read: the in-flight assistant message
+                // if one is streaming, else the last assistant reply on the page
+                // (e.g. a "replay last response"). That bubble gets the highlight.
+                val id = streamingMessageId ?: lastAssistantMessageId()
+                _uiState.update { it.copy(speakingMessageId = id, audioPaused = false) }
+            }
             is ServerMessage.TtsEnd -> audioPlayer.onTtsEnd()
 
             is ServerMessage.Error -> {
@@ -776,6 +810,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(pendingApprovals = it.pendingApprovals +
                         (ws to PendingApproval(m.id, m.toolName, m.summary, m.detail, ws)))
                 }
+                // Alert with a short haptic buzz instead of speaking the prompt —
+                // less noisy when the phone's in a pocket while walking/driving.
+                vibrateForApproval()
                 startApprovalTimeout(m.id, ws)
             }
             is ServerMessage.PermissionResolved -> {
@@ -835,6 +872,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         persistPages()
     }
 
+    /** Tap on the bubble that's currently being spoken: pause it, or resume it
+     * if already paused. Leaves the highlight up so you can toggle back. */
+    fun toggleSpeakingPause() {
+        audioPlayer.togglePause()
+    }
+
+    private fun lastAssistantMessageId(): String? =
+        _uiState.value.run { pages.getOrNull(activePageIndex) }
+            ?.messages?.lastOrNull { it.role == Role.ASSISTANT }?.id
+
     /** Ask the server to speak the current project's last response again — for
      * hearing a reply that finished while you were on another project. */
     fun replayLastResponse() {
@@ -849,6 +896,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         approvalTimeoutJobs.remove(ws)?.cancel()
         wsClient.sendJson(PermissionResponseMsg(id = pending.id, approved = approved))
         _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - ws) }
+    }
+
+    /** Short double-buzz to flag that a tool is waiting on approval — a quiet
+     * alternative to speaking the prompt aloud. */
+    private fun vibrateForApproval() {
+        val ctx = getApplication<Application>()
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vm = ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            vm?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        } ?: return
+        if (!vibrator.hasVibrator()) return
+        // timings: wait 0, buzz 60, pause 90, buzz 60 — a light "tick-tick".
+        val pattern = longArrayOf(0, 60, 90, 60)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(pattern, -1)
+        }
     }
 
     /** Auto-deny if the user doesn't respond, so a forgotten prompt can't hang. */

@@ -543,7 +543,7 @@ class ConnectionHandler:
             id=pid, tool_name=meta["tool_name"],
             summary=meta["summary"], detail=meta["detail"],
         ))
-        self._speak(rt, meta["spoken"])
+        # No spoken prompt — the phone buzzes instead (quieter in a pocket).
         rt.approval_timers[pid] = asyncio.create_task(self._approval_timeout(rt, pid))
 
     async def _approval_timeout(self, rt: WorkspaceRuntime, pid: str) -> None:

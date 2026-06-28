@@ -400,9 +400,15 @@ private fun SessionScreen(
                 // pager's own drag handler would axis-lock to that scroll.
                 userScrollEnabled = false,
             ) { pageIndex ->
+                val active = pageIndex == pagerState.currentPage
                 TranscriptList(
                     page = uiState.pages[pageIndex],
-                    isActive = pageIndex == pagerState.currentPage,
+                    isActive = active,
+                    // The speaking highlight only applies to the page on screen
+                    // (TTS only ever streams for the active workspace).
+                    speakingMessageId = if (active) uiState.speakingMessageId else null,
+                    audioPaused = uiState.audioPaused,
+                    onToggleSpeaking = { viewModel.toggleSpeakingPause() },
                 )
             }
 
@@ -432,7 +438,13 @@ private fun SessionScreen(
 }
 
 @Composable
-private fun TranscriptList(page: ChatPage, isActive: Boolean) {
+private fun TranscriptList(
+    page: ChatPage,
+    isActive: Boolean,
+    speakingMessageId: String? = null,
+    audioPaused: Boolean = false,
+    onToggleSpeaking: () -> Unit = {},
+) {
     val listState = rememberLazyListState()
     // Sit at the very bottom whenever this page is the one on screen — both as new
     // messages arrive and the moment you flip to it (its scrollback repaints from
@@ -471,7 +483,13 @@ private fun TranscriptList(page: ChatPage, isActive: Boolean) {
         contentPadding = PaddingValues(vertical = 8.dp),
     ) {
         items(page.messages, key = { it.id }) { message ->
-            MessageBubble(message = message)
+            val speaking = message.id == speakingMessageId
+            MessageBubble(
+                message = message,
+                isSpeaking = speaking,
+                isPaused = speaking && audioPaused,
+                onTapSpeaking = if (speaking) onToggleSpeaking else null,
+            )
         }
     }
 }

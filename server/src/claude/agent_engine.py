@@ -80,11 +80,14 @@ class AgentSession:
         self.session_id: str | None = resume
 
     async def start(self) -> None:
-        hooks = None
-        if self._gated:
-            # matcher is an alternation regex of tool names, e.g. "Bash|Write".
-            matcher = "|".join(self._gated)
-            hooks = {"PreToolUse": [HookMatcher(matcher=matcher, hooks=[self._pretool_hook])]}
+        # Install ONE PreToolUse authority over *all* tools (matcher=None ==
+        # match everything). Gated tools (e.g. Bash) round-trip to the phone for
+        # approval; every other tool is allowed immediately. This explicit allow
+        # is load-bearing: without it, non-gated write tools (Write/Edit/...)
+        # fall through to the SDK's default permission path, which has no
+        # responder in this headless setup and silently denies them
+        # ("...but you haven't granted it yet"), so file edits never reach disk.
+        hooks = {"PreToolUse": [HookMatcher(matcher=None, hooks=[self._pretool_hook])]}
 
         options = ClaudeAgentOptions(
             cwd=self._cwd,
@@ -105,10 +108,26 @@ class AgentSession:
             self._cwd, self._gated, self._resume,
         )
 
+    @staticmethod
+    def _decision(decision: str, reason: str) -> dict:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": decision,
+                "permissionDecisionReason": reason,
+            }
+        }
+
     async def _pretool_hook(self, input_data, tool_use_id, context):
-        """Fires before a gated tool runs. Defer to the phone approval callback."""
+        """Fires before *every* tool. Gated tools (e.g. Bash) defer to the phone
+        approval callback; all other tools are allowed straight through so they
+        never stall on the SDK's unanswerable default permission prompt."""
         tool = input_data.get("tool_name", "?")
         tool_input = input_data.get("tool_input") or {}
+
+        if tool not in self._gated:
+            return self._decision("allow", "Tool not gated")
+
         try:
             approved = await self._on_permission(tool, tool_input)
         except Exception:
@@ -116,20 +135,8 @@ class AgentSession:
             approved = False
 
         if approved:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": "Approved by user",
-                }
-            }
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "Denied by user on phone",
-            }
-        }
+            return self._decision("allow", "Approved by user")
+        return self._decision("deny", "Denied by user on phone")
 
     async def query(self, text: str) -> None:
         if self._client is None:
