@@ -30,6 +30,11 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 private val Context.settingsStore by preferencesDataStore("settings")
 private val KEY_SERVER_URL = stringPreferencesKey("server_url")
@@ -70,6 +75,10 @@ data class ChatPage(
     val currentWorkspace: String? = null,
     val messages: List<ChatMessage> = emptyList(),
     val isResponding: Boolean = false,
+    // Highest event-log seq applied for this workspace (-1 = nothing yet). The
+    // page's whole transcript is a fold of the server's event log up to here;
+    // re-selecting/reconnecting sends this as `since` to catch up.
+    val cursor: Int = -1,
 )
 
 /** A tool the server is asking us to approve before it runs (e.g. a shell command). */
@@ -130,8 +139,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState
 
-    // Currently streaming assistant message ID (for the active page)
-    private var streamingMessageId: String? = null
+    // Monotonic counter for optimistic local message ids (the user's own bubble,
+    // shown instantly before the server's user_msg event echoes back and adopts
+    // it). Kept distinct from "ev-<seq>" log ids.
+    private var localIdCounter = 0L
 
     // True once we've told the user the server is unavailable, so the silent
     // reconnect loop doesn't spam the chat. Reset on a successful connect.
@@ -144,10 +155,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // Timestamp (ms) of an outstanding user-initiated ping, for RTT reporting.
     // 0 means no ping is in flight.
     private var pingSentAt = 0L
-
-    // Phone-side auto-deny timers for outstanding approval prompts, keyed by the
-    // workspace each belongs to (approvals are per-project now).
-    private val approvalTimeoutJobs = mutableMapOf<String, Job>()
 
     init {
         audioPlayer.initialize()
@@ -223,10 +230,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     // Drop the live dashboard + any pending approvals: with no
                     // socket we can't know the server's state, so showing the
-                    // last-known count/dots/prompt would be misleading. (FCM, later,
-                    // restores awareness while away.)
-                    approvalTimeoutJobs.values.forEach { it.cancel() }
-                    approvalTimeoutJobs.clear()
+                    // last-known count/dots/prompt would be misleading. On
+                    // reconnect, the event-log sync re-surfaces any still-open
+                    // approval. (FCM, later, restores awareness while away.)
                     _uiState.update {
                         it.copy(
                             sessionStatuses = emptyList(),
@@ -501,11 +507,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             wsClient.sendJson(InterruptMsg())
         }
         audioPlayer.stop()
-        updateActivePage { it.copy(isResponding = false) }
-        streamingMessageId?.let { id ->
-            updateActiveMessage(id) { it.copy(isStreaming = false) }
+        // Local snappy feedback; the server's turn_state(false) event will
+        // confirm this through the log shortly after.
+        updateActivePage { p ->
+            p.copy(
+                isResponding = false,
+                messages = p.messages.map { if (it.isStreaming) it.copy(isStreaming = false) else it },
+            )
         }
-        streamingMessageId = null
     }
 
     fun updateServerUrl(url: String) {
@@ -528,12 +537,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 pages.add(ChatPage(currentWorkspace = name))
                 idx = pages.lastIndex
             }
-            // Keep any existing messages on screen; the server's repaint replaces
-            // them in place, so reopening never flashes empty before it loads.
+            // Keep any existing messages on screen; the server's sync replaces or
+            // appends in place, so reopening never flashes empty before it loads.
             s.copy(pages = pages, activePageIndex = idx, onHome = false)
         }
-        streamingMessageId = null
-        wsClient.sendJson(SelectWorkspaceMsg(name = name))
+        // Select for audio routing + catch this page's event log up from its
+        // cursor (-1 for a freshly-opened page → server replays scrollback).
+        val since = _uiState.value.pages.firstOrNull { it.currentWorkspace == name }?.cursor ?: -1
+        wsClient.sendJson(SelectWorkspaceMsg(name = name, since = since))
         persistPages()
     }
 
@@ -544,7 +555,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Cut local audio so the session we're leaving doesn't keep talking at us
         // on the list, and detach the streaming cursor.
         audioPlayer.stop()
-        streamingMessageId = null
         _uiState.update { it.copy(onHome = true) }
         wsClient.sendJson(DeactivateMsg())
         persistPages()
@@ -578,9 +588,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (state.onHome) return
         val page = state.pages.getOrNull(state.activePageIndex) ?: return
         val ws = page.currentWorkspace ?: return
-        // Leave the page's messages up; the server repaint replaces them in place.
-        streamingMessageId = null
-        wsClient.sendJson(SelectWorkspaceMsg(name = ws))
+        // Catch up from our cursor: the server sends just what we missed while
+        // disconnected (or a full reset if it restarted with a fresh log).
+        wsClient.sendJson(SelectWorkspaceMsg(name = ws, since = page.cursor))
     }
 
     /** A swipe between open sessions inside the conversation view. */
@@ -591,22 +601,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (index !in state.pages.indices) return
 
         // Switching away does NOT interrupt the old workspace — it keeps running
-        // in the background on the server. Just stop local audio so its TTS
-        // doesn't bleed into the page we're moving to, and detach the streaming
-        // cursor so the new page's deltas land in a fresh bubble.
+        // in the background on the server (and its events keep streaming to us).
+        // Just stop local audio so its TTS doesn't bleed into the page we move to.
         audioPlayer.stop()
-        streamingMessageId = null
 
-        // Keep the page's current messages on screen; the server's repaint
-        // (ConversationHistory, sent on selection) replaces them in place. Not
-        // blanking first means flipping to an already-open project shows its chat
-        // continuously rather than flashing empty for a frame before it repaints.
-        val ws = state.pages[index].currentWorkspace
+        val page = state.pages[index]
         _uiState.update { it.copy(activePageIndex = index) }
 
-        // Tell the server which workspace is now on screen. It replays scrollback
-        // and any in-flight progress for that workspace (without interrupting it).
-        ws?.let { wsClient.sendJson(SelectWorkspaceMsg(name = it)) }
+        // Tell the server which workspace now routes audio, and catch this page's
+        // log up from its cursor (usually already current, since background pages
+        // stream live too — so the switch is instant, no repaint).
+        page.currentWorkspace?.let {
+            wsClient.sendJson(SelectWorkspaceMsg(name = it, since = page.cursor))
+        }
         persistPages()
     }
 
@@ -644,81 +651,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleServerMessage(json: String) {
-        val msg = parseServerMessage(json)
-        // The workspace currently on screen (null when we're on the home list).
-        // A page-bound message tagged for any other workspace is a stale repaint
-        // for a project we're not looking at — drop it, or it lands in the wrong
-        // window (or paints under the home list).
-        val activeWs = _uiState.value.run {
-            if (onHome) null else pages.getOrNull(activePageIndex)?.currentWorkspace
-        }
-        fun mismatched(ws: String) = ws.isNotEmpty() && ws != activeWs
-
-        when (msg) {
-            is ServerMessage.Transcription -> {
-                addUserMessage(msg.msg.text)
-            }
-
-            is ServerMessage.ResponseDelta -> {
-                if (mismatched(msg.msg.workspace)) return
-                updateActivePage { it.copy(isResponding = true) }
-                val id = streamingMessageId
-                if (id != null) {
-                    updateActiveMessage(id) { it.copy(text = it.text + msg.msg.text) }
-                } else {
-                    val newMsg = ChatMessage(
-                        role = Role.ASSISTANT,
-                        text = msg.msg.text,
-                        isStreaming = true,
-                    )
-                    streamingMessageId = newMsg.id
-                    addMessage(newMsg)
-                }
-            }
-
-            is ServerMessage.ResponseEnd -> {
-                if (mismatched(msg.msg.workspace)) return
-                updateActivePage { it.copy(isResponding = false) }
-                streamingMessageId?.let { id ->
-                    updateActiveMessage(id) { it.copy(isStreaming = false) }
-                }
-                streamingMessageId = null
-            }
-
-            is ServerMessage.ToolUse -> {
-                if (mismatched(msg.msg.workspace)) return
-                addMessage(ChatMessage(
-                    role = Role.TOOL,
-                    text = "Using ${msg.msg.toolName}...",
-                    toolName = msg.msg.toolName,
-                ))
-            }
-
-            is ServerMessage.ToolResult -> {
-                if (mismatched(msg.msg.workspace)) return
-                val summary = if (msg.msg.success) "Done" else "Failed"
-                addMessage(ChatMessage(
-                    role = Role.TOOL,
-                    text = "$summary: ${msg.msg.toolName}",
-                    toolName = msg.msg.toolName,
-                    toolOutput = msg.msg.output,
-                ))
-            }
+        when (val msg = parseServerMessage(json)) {
+            is ServerMessage.Event -> applyEvent(msg.msg.workspace, msg.msg.event)
+            is ServerMessage.EventDelta -> applyEventDelta(msg.msg.workspace, msg.msg.seq, msg.msg.text)
+            is ServerMessage.Sync -> applySync(msg.msg)
 
             is ServerMessage.TtsStart -> {
                 audioPlayer.onTtsStart()
-                // Mark which bubble is being read: the in-flight assistant message
-                // if one is streaming, else the last assistant reply on the page
-                // (e.g. a "replay last response"). That bubble gets the highlight.
-                val id = streamingMessageId ?: lastAssistantMessageId()
+                // Highlight the bubble the server says it's reading (by event
+                // seq), falling back to the last assistant reply (e.g. a replay).
+                val id = if (msg.msg.targetSeq >= 0) "ev-${msg.msg.targetSeq}"
+                         else lastAssistantMessageId()
                 _uiState.update { it.copy(speakingMessageId = id, audioPaused = false) }
             }
             is ServerMessage.TtsEnd -> audioPlayer.onTtsEnd()
 
             is ServerMessage.Error -> {
-                if (mismatched(msg.msg.workspace)) return
-                addSystemMessage("Error: ${msg.msg.message}")
+                val ws = msg.msg.workspace
+                val idx = _uiState.value.pages.indexOfFirst { it.currentWorkspace == ws }
+                val sys = ChatMessage(
+                    id = "local-${localIdCounter++}", role = Role.SYSTEM,
+                    text = "Error: ${msg.msg.message}",
+                )
+                if (idx >= 0) updatePage(idx) { it.copy(messages = it.messages + sys) }
+                else addSystemMessage("Error: ${msg.msg.message}")
             }
+
+            // The selection ack — audio routing only; scrollback + responding
+            // state arrive through the event log (`sync`), so nothing to do here.
+            is ServerMessage.WorkspaceSelected -> {}
 
             is ServerMessage.WorkspaceList -> {
                 val workspaces = msg.msg.workspaces.map { Workspace(it.name, it.path) }
@@ -738,45 +699,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 // No auto-select: the home list is the landing screen. The user
                 // picks which project to open.
-            }
-
-            is ServerMessage.WorkspaceSelected -> {
-                // Only the repaint for the page we're actually on (a stale one for
-                // a workspace we've swiped past would flip the wrong page's state).
-                if (mismatched(msg.msg.name)) return
-                // Reflect whether this workspace still has a turn running in the
-                // background, so the "Thinking…" indicator is right on switch-back.
-                updateActivePage { it.copy(isResponding = msg.msg.responding) }
-            }
-
-            is ServerMessage.ConversationHistory -> {
-                if (mismatched(msg.msg.workspace)) return
-                // Replayed scrollback for a resumed session — repaint the page so
-                // a continued conversation isn't visually blank on reopen.
-                val restored = msg.msg.messages.mapIndexed { i, h ->
-                    val role = when (h.role) {
-                        "user" -> Role.USER
-                        "assistant" -> Role.ASSISTANT
-                        "tool" -> Role.TOOL
-                        else -> Role.SYSTEM
-                    }
-                    ChatMessage(
-                        // Stable, position-based id so re-painting the SAME
-                        // scrollback (which happens on every flip to an already-open
-                        // project) yields identical list keys. Otherwise each
-                        // ChatMessage gets a fresh random id, the LazyColumn sees all
-                        // keys change, and it tears down + rebuilds every row — the
-                        // blink that showed ~half a second after each swipe.
-                        id = "hist-$i",
-                        role = role,
-                        text = h.text,
-                        toolName = h.toolName,
-                        toolOutput = h.toolOutput,
-                    )
-                }
-                if (restored.isNotEmpty()) {
-                    updateActivePage { it.copy(messages = restored) }
-                }
             }
 
             is ServerMessage.SessionsStatus -> {
@@ -800,31 +722,154 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     addSystemMessage("Server responsive ✓ (${rtt} ms)")
                 }
             }
-            is ServerMessage.PermissionRequest -> {
-                // Pin the approval to its own workspace so it shows only on that
-                // project's page (and stays put when you swipe elsewhere).
-                val m = msg.msg
-                val ws = m.workspace
-                approvalTimeoutJobs.remove(ws)?.cancel()
-                _uiState.update {
-                    it.copy(pendingApprovals = it.pendingApprovals +
-                        (ws to PendingApproval(m.id, m.toolName, m.summary, m.detail, ws)))
-                }
-                // Alert with a short haptic buzz instead of speaking the prompt —
-                // less noisy when the phone's in a pocket while walking/driving.
-                vibrateForApproval()
-                startApprovalTimeout(m.id, ws)
-            }
-            is ServerMessage.PermissionResolved -> {
-                // Settled server-side (often a spoken yes/no). Dismiss whichever
-                // workspace's approval carries this id.
-                val entry = _uiState.value.pendingApprovals.entries.firstOrNull { it.value.id == msg.msg.id }
-                if (entry != null) {
-                    approvalTimeoutJobs.remove(entry.key)?.cancel()
-                    _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - entry.key) }
-                }
-            }
             is ServerMessage.Unknown -> Log.w(TAG, "Unknown message type: ${msg.type}")
+        }
+    }
+
+    // ---- Event-log reducer ----------------------------------------------------
+    // Each open page's transcript is a fold of its workspace's server-side event
+    // log. Apply is idempotent by seq (dups ignored), and a non-contiguous seq
+    // triggers a re-subscribe from our cursor — so a dropped/reordered frame
+    // self-heals instead of corrupting the transcript.
+
+    private fun JsonObject.int(k: String, d: Int = -1) = this[k]?.jsonPrimitive?.intOrNull ?: d
+    private fun JsonObject.str(k: String, d: String = "") = this[k]?.jsonPrimitive?.contentOrNull ?: d
+    private fun JsonObject.bool(k: String, d: Boolean = false) = this[k]?.jsonPrimitive?.booleanOrNull ?: d
+
+    private fun applyEvent(ws: String, ev: JsonObject) {
+        val state = _uiState.value
+        val idx = state.pages.indexOfFirst { it.currentWorkspace == ws }
+        if (idx < 0) return  // not an open page — ignore
+        val cursor = state.pages[idx].cursor
+        val seq = ev.int("seq")
+        if (seq <= cursor) return                       // duplicate
+        if (seq > cursor + 1) {                          // gap → catch up
+            wsClient.sendJson(SubscribeMsg(workspace = ws, since = cursor))
+            return
+        }
+        // A live (not replayed) permission request is what triggers the buzz.
+        if (ev.str("kind") == "permission_req") vibrateForApproval()
+        _uiState.update { foldEvent(it, idx, ev) }
+    }
+
+    private fun applyEventDelta(ws: String, seq: Int, text: String) {
+        val state = _uiState.value
+        val idx = state.pages.indexOfFirst { it.currentWorkspace == ws }
+        if (idx < 0) return
+        val id = "ev-$seq"
+        if (state.pages[idx].messages.none { it.id == id }) {
+            // We don't have the assistant_text event this delta extends — gap.
+            wsClient.sendJson(SubscribeMsg(workspace = ws, since = state.pages[idx].cursor))
+            return
+        }
+        updatePage(idx) { p ->
+            p.copy(messages = p.messages.map {
+                if (it.id == id) it.copy(text = it.text + text) else it
+            })
+        }
+    }
+
+    private fun applySync(m: SyncMsg) {
+        val ws = m.workspace
+        _uiState.update { st ->
+            val idx = st.pages.indexOfFirst { it.currentWorkspace == ws }
+            if (idx < 0) return@update st
+            var state = st
+            if (m.reset) {
+                // We had a gap (or fresh page / server restart): rebuild from
+                // scratch. Clear this page's messages, cursor, and any approval.
+                val pages = state.pages.toMutableList()
+                pages[idx] = pages[idx].copy(messages = emptyList(), cursor = -1, isResponding = false)
+                state = state.copy(pages = pages, pendingApprovals = state.pendingApprovals - ws)
+            }
+            for (ev in m.events) {
+                val curIdx = state.pages.indexOfFirst { it.currentWorkspace == ws }
+                if (curIdx < 0) break
+                if (ev.int("seq") <= state.pages[curIdx].cursor) continue
+                state = foldEvent(state, curIdx, ev)
+            }
+            state
+        }
+    }
+
+    /** Apply one contiguous event to the page at [idx]: advance its cursor and
+     * mutate messages / approvals, then recompute the streaming flag. */
+    private fun foldEvent(state: ChatUiState, idx: Int, ev: JsonObject): ChatUiState {
+        val ws = state.pages[idx].currentWorkspace ?: ""
+        val seq = ev.int("seq")
+        val kind = ev.str("kind")
+        var approvals = state.pendingApprovals
+        var page = state.pages[idx]
+
+        when (kind) {
+            "permission_req" -> approvals = approvals + (ws to PendingApproval(
+                id = ev.str("id"), toolName = ev.str("tool_name"),
+                summary = ev.str("summary"), detail = ev.str("detail"), workspace = ws,
+            ))
+            "permission_res" -> if (approvals[ws]?.id == ev.str("id")) approvals = approvals - ws
+            else -> page = applyLogMessage(page, seq, kind, ev)
+        }
+
+        page = page.copy(cursor = seq)
+        if (kind != "permission_req" && kind != "permission_res") page = page.withStreamingFlags()
+        val pages = state.pages.toMutableList().also { it[idx] = page }
+        return state.copy(pages = pages, pendingApprovals = approvals)
+    }
+
+    /** Map a transcript event to the page's message list (no cursor handling). */
+    private fun applyLogMessage(page: ChatPage, seq: Int, kind: String, ev: JsonObject): ChatPage {
+        val id = "ev-$seq"
+        return when (kind) {
+            "user_msg" -> {
+                val text = ev.str("text")
+                // Adopt a matching optimistic local echo rather than duplicating.
+                val local = page.messages.indexOfLast {
+                    it.role == Role.USER && it.id.startsWith("local-") && it.text == text
+                }
+                if (local >= 0) {
+                    val msgs = page.messages.toMutableList()
+                    msgs[local] = msgs[local].copy(id = id)
+                    page.copy(messages = msgs)
+                } else {
+                    page.copy(messages = page.messages + ChatMessage(id = id, role = Role.USER, text = text))
+                }
+            }
+            "assistant_text" -> page.copy(messages = page.messages +
+                ChatMessage(id = id, role = Role.ASSISTANT, text = ev.str("text"), isStreaming = true))
+            "tool_use" -> page.copy(messages = page.messages + ChatMessage(
+                id = id, role = Role.TOOL,
+                text = "Using ${ev.str("tool_name")}...",
+                toolName = ev.str("tool_name").ifEmpty { null },
+            ))
+            "tool_result" -> {
+                val ok = ev.bool("success")
+                val tn = ev.str("tool_name")
+                page.copy(messages = page.messages + ChatMessage(
+                    id = id, role = Role.TOOL,
+                    text = "${if (ok) "Done" else "Failed"}: $tn",
+                    toolName = tn.ifEmpty { null },
+                    toolOutput = ev.str("output").ifEmpty { null },
+                ))
+            }
+            "turn_state" -> page.copy(isResponding = ev.bool("responding"))
+            else -> page
+        }
+    }
+
+    /** The last message is "streaming" (blinking cursor) only while the turn is
+     * responding and that last message is an assistant bubble. */
+    private fun ChatPage.withStreamingFlags(): ChatPage {
+        val last = messages.lastOrNull()
+        val streamingId = if (isResponding && last?.role == Role.ASSISTANT) last.id else null
+        return copy(messages = messages.map { it.copy(isStreaming = it.id == streamingId) })
+    }
+
+    private fun updatePage(index: Int, transform: (ChatPage) -> ChatPage) {
+        _uiState.update { state ->
+            if (index !in state.pages.indices) return@update state
+            val pages = state.pages.toMutableList()
+            pages[index] = transform(pages[index])
+            state.copy(pages = pages)
         }
     }
 
@@ -836,7 +881,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * page slid in. History is kept — reopening resumes. */
     fun closeWorkspace() {
         val name = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace } ?: return
-        streamingMessageId = null
         closeWorkspace(name)
         if (_uiState.value.onHome) {
             // Nothing left on screen — make sure the server stops streaming too.
@@ -853,7 +897,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * conversation transcript is kept so reopening resumes it. */
     fun closeWorkspace(name: String) {
         wsClient.sendJson(CloseWorkspaceMsg(name = name))
-        approvalTimeoutJobs.remove(name)?.cancel()
         _uiState.update { s ->
             val idx = s.pages.indexOfFirst { it.currentWorkspace == name }
             val pages = s.pages.toMutableList()
@@ -889,11 +932,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         wsClient.sendJson(ReplayLastMsg())
     }
 
-    /** User tapped Approve/Deny on the on-screen project's pending prompt. */
+    /** User tapped Approve/Deny on the on-screen project's pending prompt.
+     * Optimistically dismiss it; the server's permission_res event confirms. */
     fun respondToApproval(approved: Boolean) {
         val ws = _uiState.value.run { pages.getOrNull(activePageIndex)?.currentWorkspace } ?: return
         val pending = _uiState.value.pendingApprovals[ws] ?: return
-        approvalTimeoutJobs.remove(ws)?.cancel()
         wsClient.sendJson(PermissionResponseMsg(id = pending.id, approved = approved))
         _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - ws) }
     }
@@ -920,18 +963,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Auto-deny if the user doesn't respond, so a forgotten prompt can't hang. */
-    private fun startApprovalTimeout(id: String, ws: String) {
-        approvalTimeoutJobs.remove(ws)?.cancel()
-        approvalTimeoutJobs[ws] = viewModelScope.launch {
-            delay(30_000)
-            if (_uiState.value.pendingApprovals[ws]?.id == id) {
-                wsClient.sendJson(PermissionResponseMsg(id = id, approved = false))
-                _uiState.update { it.copy(pendingApprovals = it.pendingApprovals - ws) }
-            }
-        }
-    }
-
     private fun handleBinaryMessage(data: ByteArray) {
         if (data.isEmpty()) return
         val prefix = data[0]
@@ -943,7 +974,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun addUserMessage(text: String, imageUri: Uri? = null) {
-        addMessage(ChatMessage(role = Role.USER, text = text, imageUri = imageUri))
+        // Optimistic local echo. When the server's user_msg event arrives, the
+        // reducer matches this by text and adopts it (rewrites the id to the
+        // log's "ev-<seq>"), so it isn't duplicated.
+        addMessage(ChatMessage(
+            id = "local-${localIdCounter++}", role = Role.USER, text = text, imageUri = imageUri,
+        ))
     }
 
     private fun addSystemMessage(text: String) {
@@ -953,14 +989,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun addMessage(msg: ChatMessage) {
         updateActivePage { page ->
             page.copy(messages = page.messages + msg)
-        }
-    }
-
-    private fun updateActiveMessage(id: String, transform: (ChatMessage) -> ChatMessage) {
-        updateActivePage { page ->
-            page.copy(messages = page.messages.map {
-                if (it.id == id) transform(it) else it
-            })
         }
     }
 

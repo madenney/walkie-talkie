@@ -29,8 +29,13 @@ class WsClient(
         .build()
 
     private var webSocket: WebSocket? = null
-    private val _events = MutableSharedFlow<WsEvent>(replay = 1, extraBufferCapacity = 64)
-    val events: SharedFlow<WsEvent> = _events
+    // Unbounded channel, not a buffered SharedFlow: under a burst (a big sync
+    // plus streaming deltas plus TTS audio) a fixed buffer would silently drop
+    // frames. Dropped text would corrupt the transcript; here nothing drops, and
+    // the event-log cursor re-syncs anything lost across a reconnect anyway.
+    // Single-consumer (ChatViewModel) — receiveAsFlow is collected exactly once.
+    private val _events = Channel<WsEvent>(Channel.UNLIMITED)
+    val events: Flow<WsEvent> = _events.receiveAsFlow()
 
     private val _connectionState = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _connectionState
@@ -50,7 +55,7 @@ class WsClient(
         if (_connectionState.value) return
         webSocket?.cancel()
         connectAttempt++
-        _events.tryEmit(WsEvent.Connecting(connectAttempt, url))
+        _events.trySend(WsEvent.Connecting(connectAttempt, url))
         val request = Request.Builder().url(url).build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -59,15 +64,15 @@ class WsClient(
                 reconnectJob?.cancel()
                 reconnectJob = null
                 _connectionState.value = true
-                _events.tryEmit(WsEvent.Connected)
+                _events.trySend(WsEvent.Connected)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                _events.tryEmit(WsEvent.TextReceived(text))
+                _events.trySend(WsEvent.TextReceived(text))
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                _events.tryEmit(WsEvent.BinaryReceived(bytes.toByteArray()))
+                _events.trySend(WsEvent.BinaryReceived(bytes.toByteArray()))
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -77,14 +82,14 @@ class WsClient(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(TAG, "Disconnected: $code $reason")
                 _connectionState.value = false
-                _events.tryEmit(WsEvent.Disconnected)
+                _events.trySend(WsEvent.Disconnected)
                 scheduleReconnect()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket failure", t)
                 _connectionState.value = false
-                _events.tryEmit(WsEvent.Failure(t))
+                _events.trySend(WsEvent.Failure(t))
                 scheduleReconnect()
             }
         })
@@ -125,6 +130,7 @@ class WsClient(
             is ImageMsg -> WsJson.encodeToString(ImageMsg.serializer(), msg)
             is InterruptMsg -> WsJson.encodeToString(InterruptMsg.serializer(), msg)
             is SelectWorkspaceMsg -> WsJson.encodeToString(SelectWorkspaceMsg.serializer(), msg)
+            is SubscribeMsg -> WsJson.encodeToString(SubscribeMsg.serializer(), msg)
             is PingMsg -> WsJson.encodeToString(PingMsg.serializer(), msg)
             is PermissionResponseMsg -> WsJson.encodeToString(PermissionResponseMsg.serializer(), msg)
             is ReplayLastMsg -> WsJson.encodeToString(ReplayLastMsg.serializer(), msg)

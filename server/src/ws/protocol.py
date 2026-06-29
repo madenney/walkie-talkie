@@ -3,6 +3,18 @@
 Text frames carry JSON with a "type" field. Binary frames carry audio
 with a 1-byte prefix: 0x01 = mic audio (phone→server), 0x02 = TTS audio
 (server→phone).
+
+Transcript content (user/assistant/tool messages, turn state, approvals) is
+delivered as an append-only, per-workspace **event log**: each event has a
+monotonic ``seq`` and the phone keeps a cursor. Live events stream as ``event``
+/ ``event_delta`` frames; a ``sync`` frame replays the tail from a cursor
+(switch, reconnect, cold open, or gap recovery). This makes a dropped/reordered
+frame *recoverable* (the phone re-subscribes from its cursor) rather than
+silently corrupting the transcript, and makes switching workspaces a pure
+client-side render change instead of a server-side repaint.
+
+Ephemeral, audio-coupled signals (TTS start/end), the dashboard snapshot, and
+connection-level acks stay as their own control frames — they don't need replay.
 """
 
 from __future__ import annotations
@@ -24,6 +36,17 @@ class AudioPrefix(IntEnum):
 class SelectWorkspace(BaseModel):
     type: Literal["select_workspace"] = "select_workspace"
     name: str
+    # The phone's current cursor for this workspace's event log (-1 = "I have
+    # nothing, send me recent history"). The server answers with a `sync` frame.
+    since: int = -1
+
+
+class Subscribe(BaseModel):
+    """Catch up a workspace's event log from a cursor — used for gap recovery
+    when the phone sees a non-contiguous seq mid-stream."""
+    type: Literal["subscribe"] = "subscribe"
+    workspace: str
+    since: int = -1
 
 
 class AudioStart(BaseModel):
@@ -78,68 +101,73 @@ class CloseWorkspace(BaseModel):
 
 class Deactivate(BaseModel):
     """Phone moved to the home/sessions list — no workspace is on screen. Every
-    workspace keeps running in the background, but the server streams nothing
-    (no text, no TTS) until the phone selects a workspace again."""
+    workspace keeps running in the background and its events still stream (cheap
+    JSON), but no TTS audio is sent until a workspace is selected again."""
     type: Literal["deactivate"] = "deactivate"
 
 
-# --- Server → Phone messages ---
+# --- Server → Phone: the event log ---
+#
+# An event is a plain dict: {"seq": int, "kind": str, ...payload}. Kinds:
+#   user_msg        {text}
+#   assistant_text  {text}                 # grows via event_delta
+#   tool_use        {tool_id, tool_name, input}
+#   tool_result     {tool_id, tool_name, success, output}
+#   turn_state      {responding: bool}
+#   permission_req  {id, tool_name, summary, detail}
+#   permission_res  {id, approved}
 
-class Transcription(BaseModel):
-    type: Literal["transcription"] = "transcription"
+class EventFrame(BaseModel):
+    """One newly-appended event for a workspace's log."""
+    type: Literal["event"] = "event"
+    workspace: str
+    event: dict[str, Any]
+
+
+class EventDelta(BaseModel):
+    """Append streamed text to an already-sent assistant_text event (by seq)."""
+    type: Literal["event_delta"] = "event_delta"
+    workspace: str
+    seq: int
     text: str
-    is_final: bool = True
 
 
-# NOTE: every message the phone routes to a specific workspace's page carries a
-# `workspace` field, so the phone can ignore anything not meant for the page it's
-# on (during rapid workspace switches, repaints for the old workspace can still be
-# in flight). It's stamped centrally when sent — see WorkspacePool.send.
+class Sync(BaseModel):
+    """Replay a workspace's event-log tail from a cursor.
 
-class ResponseDelta(BaseModel):
-    type: Literal["response_delta"] = "response_delta"
-    text: str
-    workspace: str = ""
-
-
-class ResponseEnd(BaseModel):
-    type: Literal["response_end"] = "response_end"
-    workspace: str = ""
+    ``reset`` means the phone had a gap (or no data) and should REPLACE its view
+    for this workspace with ``events``; otherwise it appends them. ``head_seq``
+    is the highest seq the server holds, so the phone can validate its cursor.
+    """
+    type: Literal["sync"] = "sync"
+    workspace: str
+    events: list[dict[str, Any]] = []
+    reset: bool = False
+    head_seq: int = -1
 
 
-class ToolUse(BaseModel):
-    type: Literal["tool_use"] = "tool_use"
-    tool_name: str
-    tool_id: str
-    input: dict[str, Any] = {}
-    workspace: str = ""
-
-
-class ToolResult(BaseModel):
-    type: Literal["tool_result"] = "tool_result"
-    tool_id: str
-    tool_name: str
-    success: bool
-    output: str = ""
-    workspace: str = ""
-
+# --- Server → Phone: ephemeral control frames ---
 
 class TTSStart(BaseModel):
     type: Literal["tts_start"] = "tts_start"
     format: str = "mp3"
+    # The assistant_text event seq being read aloud, so the phone highlights the
+    # right bubble (-1 = fall back to the last assistant message).
+    target_seq: int = -1
+    workspace: str = ""
 
 
 class TTSEnd(BaseModel):
     type: Literal["tts_end"] = "tts_end"
+    workspace: str = ""
 
 
 class Error(BaseModel):
     type: Literal["error"] = "error"
     message: str
     code: str = "unknown"
-    # Stamped when sent for a specific workspace (via WorkspacePool.send) so a
-    # background agent's error doesn't pop on whatever page you're viewing.
-    # Connection-level errors (sent directly) leave this blank → always shown.
+    # Stamped when tied to a specific workspace's turn; blank for connection-level
+    # errors (parse errors, no workspace selected), which always show.
     workspace: str = ""
 
 
@@ -147,27 +175,17 @@ class Pong(BaseModel):
     type: Literal["pong"] = "pong"
 
 
-class PermissionRequest(BaseModel):
-    type: Literal["permission_request"] = "permission_request"
-    id: str
-    tool_name: str
-    summary: str            # short spoken/displayed line, e.g. "run a shell command"
-    detail: str = ""        # the actual command/path for the on-screen card
-    workspace: str = ""
-
-
-class PermissionResolved(BaseModel):
-    """Tells the phone an approval is settled (by voice/tap/timeout) so it can
-    dismiss the prompt — needed because voice answers don't originate on the app."""
-    type: Literal["permission_resolved"] = "permission_resolved"
-    id: str
-    approved: bool
-    workspace: str = ""
-
-
 class WorkspaceList(BaseModel):
     type: Literal["workspace_list"] = "workspace_list"
     workspaces: list[dict[str, str]]  # [{name, path}]
+
+
+class WorkspaceSelected(BaseModel):
+    """Ack that a workspace is now the on-screen one (drives audio routing). The
+    scrollback + responding state arrive via the event log (`sync`)."""
+    type: Literal["workspace_selected"] = "workspace_selected"
+    name: str
+    path: str
 
 
 class SessionStatusInfo(BaseModel):
@@ -187,40 +205,16 @@ class SessionsStatus(BaseModel):
     needs_you: int = 0   # how many are blocked on an approval
 
 
-class WorkspaceSelected(BaseModel):
-    type: Literal["workspace_selected"] = "workspace_selected"
-    name: str
-    path: str
-    responding: bool = False  # a turn for this workspace is still running
-
-
-class HistoryMessage(BaseModel):
-    role: str               # "user" | "assistant" | "tool"
-    text: str
-    tool_name: str | None = None
-    tool_output: str | None = None
-    success: bool | None = None
-
-
-class ConversationHistory(BaseModel):
-    """Replayed scrollback for a resumed session, sent right after selection."""
-    type: Literal["conversation_history"] = "conversation_history"
-    messages: list[HistoryMessage] = []
-    workspace: str = ""
-
-
 # Union types for parsing
 IncomingMessage = (
     AudioStart | AudioEnd | TextMessage | ImageMessage | Interrupt | Ping
-    | SelectWorkspace | PermissionResponse | ReplayLast | CloseWorkspace
-    | Deactivate
+    | SelectWorkspace | Subscribe | PermissionResponse | ReplayLast
+    | CloseWorkspace | Deactivate
 )
 
 OutgoingMessage = (
-    Transcription | ResponseDelta | ResponseEnd | ToolUse | ToolResult
-    | TTSStart | TTSEnd | Error | Pong | WorkspaceList | WorkspaceSelected
-    | PermissionRequest | PermissionResolved | ConversationHistory
-    | SessionsStatus
+    EventFrame | EventDelta | Sync | TTSStart | TTSEnd | Error | Pong
+    | WorkspaceList | WorkspaceSelected | SessionsStatus
 )
 
 INCOMING_TYPES: dict[str, type[BaseModel]] = {
@@ -231,6 +225,7 @@ INCOMING_TYPES: dict[str, type[BaseModel]] = {
     "interrupt": Interrupt,
     "ping": Ping,
     "select_workspace": SelectWorkspace,
+    "subscribe": Subscribe,
     "permission_response": PermissionResponse,
     "replay_last": ReplayLast,
     "close_workspace": CloseWorkspace,

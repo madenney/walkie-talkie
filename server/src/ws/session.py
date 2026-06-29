@@ -12,10 +12,10 @@ runtime streams text/audio to the phone; the rest run in the background and
 persist to their SDK transcript, which is replayed on switch-back or reconnect.
 
 Because the pool outlives connections, *all* phone-bound output is routed through
-the pool (``pool.send`` / ``pool.flush_delta`` / ``pool.send_audio``) rather than
-captured against the connection that started the turn. A turn begun on a now-dead
-connection therefore keeps streaming to whichever connection is currently
-attached, with no stale-handler references.
+the pool (``pool.emit`` / ``pool.send_text_delta`` / ``pool.send_audio``) rather
+than captured against the connection that started the turn. A turn begun on a
+now-dead connection therefore keeps appending to its event log and streaming to
+whichever connection is currently attached, with no stale-handler references.
 """
 
 from __future__ import annotations
@@ -28,12 +28,26 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ..config import Settings
-from .protocol import ResponseDelta, SessionsStatus, SessionStatusInfo
+from .protocol import (
+    EventDelta,
+    EventFrame,
+    SessionsStatus,
+    SessionStatusInfo,
+    Sync,
+)
 
 if TYPE_CHECKING:
     from ..claude.agent_engine import AgentSession
 
 log = logging.getLogger(__name__)
+
+# Cap each workspace's in-memory event log so a long-lived session doesn't grow
+# unbounded. Older events live on in the SDK transcript; a phone asking for a
+# cursor below the retained window gets a `reset` sync rebuilt from there.
+LOG_CAP = 600
+# How many display messages to seed from a resumed transcript (the scrollback
+# the phone shows on reopen). Older than this isn't replayed.
+SEED_CAP = 300
 
 
 @dataclass
@@ -53,15 +67,11 @@ class WorkspaceRuntime:
     # workspace). Switching to another workspace does NOT set this.
     interrupted: bool = False
 
-    # Full display text accumulated for the current turn, so the phone can be
-    # repainted with progress-so-far when the user switches/reconnects to this
-    # workspace mid-response.
-    display_accum: str = ""
-    # How many chars of display_accum have already been delivered to the phone
-    # for the current turn. Lets repaint resend cleanly without dup/gap.
-    sent_len: int = 0
-    # Scratch buffer holding back a partial <speak> tag split across deltas.
-    disp_buf: str = ""
+    # Append-only event log + the next seq to assign. This is the authoritative
+    # transcript stream the phone renders from; it replaces the old repaint
+    # bookkeeping (display_accum/sent_len). Each event: {"seq", "kind", ...}.
+    event_log: list[dict] = field(default_factory=list, repr=False)
+    next_seq: int = 0
     # The spoken (<speak>) text of the most recent completed turn, so the phone
     # can replay it on demand — e.g. to hear a reply that finished while you were
     # looking at another project.
@@ -72,11 +82,6 @@ class WorkspaceRuntime:
 
     # Outstanding tool-permission requests for THIS workspace, id -> Future[bool].
     pending_approvals: dict[str, asyncio.Future] = field(default_factory=dict, repr=False)
-    # Display metadata per request id, kept so a background approval can be
-    # surfaced to the phone when the user switches to this workspace.
-    approval_meta: dict[str, dict] = field(default_factory=dict, repr=False)
-    # Request ids already shown on the phone (timeout started).
-    surfaced: set[str] = field(default_factory=set, repr=False)
     # Per-request auto-deny timer tasks, so they can be cancelled when an
     # approval is answered early (rather than leaving an orphan sleeping task).
     approval_timers: dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
@@ -88,11 +93,50 @@ class WorkspaceRuntime:
     def touch(self) -> None:
         self.last_activity = time.time()
 
+    def append_event(self, kind: str, **data) -> dict:
+        """Append one event to the log (assigning the next seq) and return it.
+        Pure state mutation — sending it to the phone is the pool's job."""
+        ev = {"seq": self.next_seq, "kind": kind, **data}
+        self.next_seq += 1
+        self.event_log.append(ev)
+        if len(self.event_log) > LOG_CAP:
+            # Drop the oldest; the phone re-syncs (reset) if it asks below the
+            # retained window.
+            del self.event_log[: len(self.event_log) - LOG_CAP]
+        return ev
+
+    def seed_events(self, history: list[dict]) -> None:
+        """Seed the log from a resumed SDK transcript so reopening shows
+        scrollback. Each history item is {role, text, tool_name, tool_output,
+        success}; map it to the matching event kind. Only called once, before
+        any live turn, so seqs start at 0."""
+        for h in history[-SEED_CAP:]:
+            role = h.get("role")
+            if role == "user":
+                self.append_event("user_msg", text=h.get("text", ""))
+            elif role == "assistant":
+                self.append_event("assistant_text", text=h.get("text", ""))
+            elif role == "tool":
+                if h.get("tool_output") is not None or h.get("success") is not None:
+                    self.append_event(
+                        "tool_result",
+                        tool_id="",
+                        tool_name=h.get("tool_name") or "",
+                        success=bool(h.get("success")),
+                        output=h.get("tool_output") or "",
+                    )
+                else:
+                    self.append_event(
+                        "tool_use",
+                        tool_id="",
+                        tool_name=h.get("tool_name") or "",
+                        input={},
+                    )
+
     def deny_pending_approvals(self) -> None:
         # Only resolve the futures — each blocked _request_permission has its own
-        # finally that pops the tracking dicts and sends PermissionResolved if it
-        # was surfaced. Clearing surfaced/meta here would drop that dismissal, so
-        # an interrupt (barge-in) would leave the phone's approval overlay stuck.
+        # finally that pops the tracking dict, cancels the timer, and appends a
+        # permission_res event so the phone dismisses the overlay.
         for fut in list(self.pending_approvals.values()):
             if not fut.done():
                 fut.set_result(False)
@@ -117,9 +161,6 @@ class WorkspacePool:
         # ConnectionHandler | None — duck-typed (needs .connected, .send_json,
         # .send_audio). Avoids importing the handler here.
         self.handler = None
-        # Serializes phone-bound multi-message sequences (a turn's deltas vs. a
-        # workspace activation repaint) so they can't interleave on the wire.
-        self.lock = asyncio.Lock()
 
     @property
     def active(self) -> "WorkspaceRuntime | None":
@@ -133,8 +174,8 @@ class WorkspacePool:
 
     # --------------------------------------------------------------- attach
     def attach(self, handler) -> None:
-        """A connection has come up. It becomes the live handler; the phone will
-        re-select a workspace (triggering a repaint), so nothing is active yet."""
+        """A connection has come up. It becomes the live handler; the phone
+        re-selects its on-screen workspace and re-subscribes from its cursor."""
         self.handler = handler
         self.active_name = None
 
@@ -147,35 +188,62 @@ class WorkspacePool:
             self.handler = None
             self.active_name = None
 
-    # ----------------------------------------------------------------- send
-    async def send(self, rt: WorkspaceRuntime, msg) -> None:
-        """Send one phone-bound message iff ``rt`` is the on-screen workspace.
-        Stamps the workspace so the phone can ignore anything not meant for the
-        page it's currently on."""
-        async with self.lock:
-            h = self.handler
-            if h is not None and h.connected and self.active_name == rt.name:
-                if hasattr(msg, "workspace"):
-                    msg.workspace = rt.name
-                await h.send_json(msg)
+    # ----------------------------------------------------------------- events
+    async def emit(self, rt: WorkspaceRuntime, kind: str, **data) -> dict:
+        """Append an event to ``rt``'s log and stream it to the phone.
+
+        Unlike the old gated `send`, this streams for EVERY workspace (cheap
+        JSON), not just the on-screen one — so a background turn stays live on
+        the phone and switching to it needs no repaint. Frame delivery is
+        idempotent by seq on the phone, so concurrent turns / overlapping syncs
+        can't corrupt anything. (TTS *audio*, which is heavy, still goes only to
+        the active workspace — see send_audio.)"""
+        ev = rt.append_event(kind, **data)
+        h = self.handler
+        if h is not None and h.connected:
+            await h.send_json(EventFrame(workspace=rt.name, event=ev))
+        return ev
+
+    async def send_text_delta(self, rt: WorkspaceRuntime, seq: int, text: str) -> None:
+        """Stream more text into an already-emitted assistant_text event. The
+        caller has already appended ``text`` to the stored event's payload."""
+        h = self.handler
+        if h is not None and h.connected:
+            await h.send_json(EventDelta(workspace=rt.name, seq=seq, text=text))
+
+    def build_sync(self, rt: WorkspaceRuntime, since: int) -> Sync:
+        """Build the catch-up frame for a phone at cursor ``since``.
+
+        Contiguous (``since`` within the retained window) → the tail after it,
+        appended. Otherwise (fresh cursor or a gap below the window) → the whole
+        retained log with ``reset`` so the phone replaces its view."""
+        log_ = rt.event_log
+        head = rt.next_seq - 1
+        if not log_:
+            # No events yet. A phone claiming a cursor (since >= 0) is stale —
+            # e.g. the server restarted with a fresh log — so tell it to reset.
+            return Sync(workspace=rt.name, events=[], reset=(since != head), head_seq=head)
+        earliest = log_[0]["seq"]
+        # Reset on a gap below the retained window OR a cursor ahead of our head
+        # (server restarted; the phone's old, higher cursor is stale).
+        if since < 0 or since < earliest - 1 or since > head:
+            return Sync(workspace=rt.name, events=list(log_), reset=True, head_seq=head)
+        return Sync(
+            workspace=rt.name,
+            events=[e for e in log_ if e["seq"] > since],
+            reset=False,
+            head_seq=head,
+        )
+
+    async def send_sync(self, rt: WorkspaceRuntime, since: int) -> None:
+        h = self.handler
+        if h is not None and h.connected:
+            await h.send_json(self.build_sync(rt, since))
 
     async def send_audio(self, rt: WorkspaceRuntime, data: bytes) -> None:
         h = self.handler
         if h is not None and h.connected and self.active_name == rt.name:
             await h.send_audio(data)
-
-    async def flush_delta(self, rt: WorkspaceRuntime) -> None:
-        """Deliver any not-yet-sent display text for ``rt`` (only while it's the
-        active workspace), advancing the sent cursor under the lock so a
-        concurrent repaint can't dup or gap the stream."""
-        async with self.lock:
-            h = self.handler
-            if h is None or not h.connected or self.active_name != rt.name:
-                return
-            new = rt.display_accum[rt.sent_len:]
-            if new:
-                await h.send_json(ResponseDelta(text=new, workspace=rt.name))
-                rt.sent_len = len(rt.display_accum)
 
     # --------------------------------------------------------------- status
     def status_snapshot(self):

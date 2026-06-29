@@ -49,7 +49,17 @@ data class InterruptMsg(val type: String = "interrupt")
 @Serializable
 data class SelectWorkspaceMsg(
     val type: String = "select_workspace",
-    val name: String
+    val name: String,
+    // The phone's current event-log cursor for this workspace (-1 = none yet).
+    // The server answers with a `sync` from here.
+    val since: Int = -1
+)
+
+@Serializable
+data class SubscribeMsg(
+    val type: String = "subscribe",
+    val workspace: String,
+    val since: Int = -1
 )
 
 @Serializable
@@ -76,50 +86,45 @@ data class DeactivateMsg(val type: String = "deactivate")
 
 // --- Incoming (server → phone) ---
 
+// The event log: transcript content arrives as append-only events, each with a
+// monotonic `seq`. `event` appends one; `event_delta` grows an assistant_text
+// event's text; `sync` replays the tail from a cursor (switch/reconnect/gap).
+
 @Serializable
-data class TranscriptionMsg(
+data class EventFrameMsg(
     val type: String,
-    val text: String,
-    @SerialName("is_final") val isFinal: Boolean = true
+    val workspace: String = "",
+    val event: JsonObject = JsonObject(emptyMap())
 )
 
 @Serializable
-data class ResponseDeltaMsg(
+data class EventDeltaMsg(
     val type: String,
-    val text: String,
-    val workspace: String = ""
+    val workspace: String = "",
+    val seq: Int,
+    val text: String
 )
 
 @Serializable
-data class ResponseEndMsg(val type: String, val workspace: String = "")
-
-@Serializable
-data class ToolUseMsg(
+data class SyncMsg(
     val type: String,
-    @SerialName("tool_name") val toolName: String,
-    @SerialName("tool_id") val toolId: String,
-    val input: JsonObject = JsonObject(emptyMap()),
-    val workspace: String = ""
-)
-
-@Serializable
-data class ToolResultMsg(
-    val type: String,
-    @SerialName("tool_id") val toolId: String,
-    @SerialName("tool_name") val toolName: String,
-    val success: Boolean,
-    val output: String = "",
-    val workspace: String = ""
+    val workspace: String = "",
+    val events: List<JsonObject> = emptyList(),
+    val reset: Boolean = false,
+    @SerialName("head_seq") val headSeq: Int = -1
 )
 
 @Serializable
 data class TtsStartMsg(
     val type: String,
-    val format: String = "mp3"
+    val format: String = "mp3",
+    // The assistant_text event seq being read (-1 = last assistant message).
+    @SerialName("target_seq") val targetSeq: Int = -1,
+    val workspace: String = ""
 )
 
 @Serializable
-data class TtsEndMsg(val type: String)
+data class TtsEndMsg(val type: String, val workspace: String = "")
 
 @Serializable
 data class ErrorMsg(
@@ -148,27 +153,7 @@ data class WorkspaceListMsg(
 data class WorkspaceSelectedMsg(
     val type: String,
     val name: String,
-    val path: String,
-    // True if this workspace has a turn still running in the background.
-    val responding: Boolean = false
-)
-
-@Serializable
-data class PermissionRequestMsg(
-    val type: String,
-    val id: String,
-    @SerialName("tool_name") val toolName: String,
-    val summary: String,
-    val detail: String = "",
-    val workspace: String = ""
-)
-
-@Serializable
-data class PermissionResolvedMsg(
-    val type: String,
-    val id: String,
-    val approved: Boolean,
-    val workspace: String = ""
+    val path: String
 )
 
 @Serializable
@@ -186,40 +171,19 @@ data class SessionsStatusMsg(
     @SerialName("needs_you") val needsYou: Int = 0,
 )
 
-@Serializable
-data class HistoryMessageMsg(
-    val role: String,
-    val text: String,
-    @SerialName("tool_name") val toolName: String? = null,
-    @SerialName("tool_output") val toolOutput: String? = null,
-    val success: Boolean? = null
-)
-
-@Serializable
-data class ConversationHistoryMsg(
-    val type: String,
-    val messages: List<HistoryMessageMsg> = emptyList(),
-    val workspace: String = ""
-)
-
 /**
  * Represents any incoming server message, parsed by type field.
  */
 sealed class ServerMessage {
-    data class Transcription(val msg: TranscriptionMsg) : ServerMessage()
-    data class ResponseDelta(val msg: ResponseDeltaMsg) : ServerMessage()
-    data class ResponseEnd(val msg: ResponseEndMsg) : ServerMessage()
-    data class ToolUse(val msg: ToolUseMsg) : ServerMessage()
-    data class ToolResult(val msg: ToolResultMsg) : ServerMessage()
+    data class Event(val msg: EventFrameMsg) : ServerMessage()
+    data class EventDelta(val msg: EventDeltaMsg) : ServerMessage()
+    data class Sync(val msg: SyncMsg) : ServerMessage()
     data class TtsStart(val msg: TtsStartMsg) : ServerMessage()
-    data object TtsEnd : ServerMessage()
+    data class TtsEnd(val msg: TtsEndMsg) : ServerMessage()
     data class Error(val msg: ErrorMsg) : ServerMessage()
     data object Pong : ServerMessage()
     data class WorkspaceList(val msg: WorkspaceListMsg) : ServerMessage()
     data class WorkspaceSelected(val msg: WorkspaceSelectedMsg) : ServerMessage()
-    data class PermissionRequest(val msg: PermissionRequestMsg) : ServerMessage()
-    data class PermissionResolved(val msg: PermissionResolvedMsg) : ServerMessage()
-    data class ConversationHistory(val msg: ConversationHistoryMsg) : ServerMessage()
     data class SessionsStatus(val msg: SessionsStatusMsg) : ServerMessage()
     data class Unknown(val type: String) : ServerMessage()
 }
@@ -229,20 +193,15 @@ fun parseServerMessage(json: String): ServerMessage {
     val type = obj["type"]?.toString()?.trim('"') ?: return ServerMessage.Unknown("null")
 
     return when (type) {
-        "transcription" -> ServerMessage.Transcription(WsJson.decodeFromString(json))
-        "response_delta" -> ServerMessage.ResponseDelta(WsJson.decodeFromString(json))
-        "response_end" -> ServerMessage.ResponseEnd(WsJson.decodeFromString(json))
-        "tool_use" -> ServerMessage.ToolUse(WsJson.decodeFromString(json))
-        "tool_result" -> ServerMessage.ToolResult(WsJson.decodeFromString(json))
+        "event" -> ServerMessage.Event(WsJson.decodeFromString(json))
+        "event_delta" -> ServerMessage.EventDelta(WsJson.decodeFromString(json))
+        "sync" -> ServerMessage.Sync(WsJson.decodeFromString(json))
         "tts_start" -> ServerMessage.TtsStart(WsJson.decodeFromString(json))
-        "tts_end" -> ServerMessage.TtsEnd
+        "tts_end" -> ServerMessage.TtsEnd(WsJson.decodeFromString(json))
         "error" -> ServerMessage.Error(WsJson.decodeFromString(json))
         "pong" -> ServerMessage.Pong
         "workspace_list" -> ServerMessage.WorkspaceList(WsJson.decodeFromString(json))
         "workspace_selected" -> ServerMessage.WorkspaceSelected(WsJson.decodeFromString(json))
-        "permission_request" -> ServerMessage.PermissionRequest(WsJson.decodeFromString(json))
-        "permission_resolved" -> ServerMessage.PermissionResolved(WsJson.decodeFromString(json))
-        "conversation_history" -> ServerMessage.ConversationHistory(WsJson.decodeFromString(json))
         "sessions_status" -> ServerMessage.SessionsStatus(WsJson.decodeFromString(json))
         else -> ServerMessage.Unknown(type)
     }

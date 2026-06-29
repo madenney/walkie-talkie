@@ -35,25 +35,17 @@ from .protocol import (
     AudioPrefix,
     AudioStart,
     CloseWorkspace,
-    ConversationHistory,
     Deactivate,
     Error,
-    HistoryMessage,
     ImageMessage,
     Interrupt,
-    PermissionRequest,
-    PermissionResolved,
     PermissionResponse,
     Ping,
     Pong,
     ReplayLast,
-    ResponseDelta,
-    ResponseEnd,
     SelectWorkspace,
+    Subscribe,
     TextMessage,
-    ToolResult,
-    ToolUse,
-    Transcription,
     TTSEnd,
     TTSStart,
     WorkspaceList,
@@ -105,6 +97,10 @@ class ConnectionHandler:
         self._disconnected = False
         # In-flight on-demand replay of a workspace's last spoken response.
         self._replay_task: asyncio.Task | None = None
+        # Serializes raw socket writes. Multiple workspace turns stream events
+        # concurrently through one socket; each frame is atomic, but Starlette's
+        # send isn't safe under truly concurrent coroutines, so guard the write.
+        self._send_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ sends
 
@@ -119,7 +115,8 @@ class ConnectionHandler:
         if not self.connected:
             return
         try:
-            await self.ws.send_text(msg.model_dump_json())
+            async with self._send_lock:
+                await self.ws.send_text(msg.model_dump_json())
         except (WebSocketDisconnect, RuntimeError):
             self._mark_disconnected()
 
@@ -127,7 +124,8 @@ class ConnectionHandler:
         if not self.connected:
             return
         try:
-            await self.ws.send_bytes(bytes([AudioPrefix.TTS]) + data)
+            async with self._send_lock:
+                await self.ws.send_bytes(bytes([AudioPrefix.TTS]) + data)
         except (WebSocketDisconnect, RuntimeError):
             self._mark_disconnected()
 
@@ -149,7 +147,8 @@ class ConnectionHandler:
 
         # Become the live connection for the shared pool. Any workspace already
         # running from a previous connection stays alive; the phone re-selects
-        # its on-screen workspace and we repaint it (see _activate_and_repaint).
+        # its on-screen workspace and re-subscribes from its cursor (see
+        # _activate / build_sync).
         self.pool.attach(self)
 
         if self.workspaces:
@@ -199,8 +198,12 @@ class ConnectionHandler:
         match msg:
             case Ping():
                 await self.send_json(Pong())
-            case SelectWorkspace(name=name):
-                await self._handle_select_workspace(name)
+            case SelectWorkspace(name=name, since=since):
+                await self._handle_select_workspace(name, since)
+            case Subscribe(workspace=ws, since=since):
+                rt = self.pool.runtimes.get(ws)
+                if rt is not None:
+                    await self.pool.send_sync(rt, since)
             case Deactivate():
                 # Phone went to the home list — keep every workspace running but
                 # stop streaming to a screen that isn't showing one.
@@ -262,6 +265,11 @@ class ConnectionHandler:
         # in-flight response (other workspaces keep running).
         await self._interrupt_runtime(rt)
 
+        # Log the user's message as an event (the phone renders it from here
+        # rather than echoing optimistically, so there's one source of truth).
+        # The image note is for the agent only — not shown in the bubble.
+        await self.pool.emit(rt, "user_msg", text=text)
+
         prompt = text if not image_note else f"{text}\n\n{image_note}"
         rt.interrupted = False
         rt.is_responding = True
@@ -272,15 +280,17 @@ class ConnectionHandler:
     async def _run_turn(self, rt: WorkspaceRuntime, prompt: str) -> None:
         """Run one Claude turn for ``rt``: stream text → TTS, surface tool calls.
 
-        Phone-bound output (deltas, tool cards, TTS) is emitted only while ``rt``
-        is the active workspace; otherwise the turn runs silently and persists to
-        the SDK transcript for replay on switch-back.
+        All transcript output is appended to ``rt``'s event log and streamed to
+        the phone (for every workspace, not just the on-screen one — switching is
+        a client render change). Only TTS *audio* is gated to the active
+        workspace; a backgrounded turn still streams its text/tool events.
         """
-        # Reset the repaint cursor under the lock so a concurrent activate/repaint
-        # can't read a half-reset state.
-        async with self.pool.lock:
-            rt.display_accum = ""
-            rt.sent_len = 0
+        # Display-text "hold" buffer: keeps back a partial <speak> tag split
+        # across deltas until the rest arrives. ``cur_text_ev`` is the
+        # assistant_text event currently being streamed (None between text
+        # blocks / before any); we mutate its "text" in place as deltas arrive.
+        disp_hold = ""
+        cur_text_ev: dict | None = None
         tts_buffer = ""
         in_speak = False
         speak_accum = ""
@@ -294,6 +304,7 @@ class ConnectionHandler:
             tts_task = asyncio.create_task(self._tts_consumer(rt, tts_queue))
             rt.tts_queue = tts_queue
 
+        await self.pool.emit(rt, "turn_state", responding=True)
         try:
             await rt.agent.query(prompt)
 
@@ -307,8 +318,8 @@ class ConnectionHandler:
                     # Strip <speak> tags for display — robust to a tag split across
                     # deltas: remove complete tags, then hold back any trailing
                     # partial tag until the rest of it arrives.
-                    rt.disp_buf += delta
-                    disp_buf = rt.disp_buf.replace("<speak>", "").replace("</speak>", "")
+                    disp_hold += delta
+                    disp_buf = disp_hold.replace("<speak>", "").replace("</speak>", "")
                     hold = 0
                     for tag in ("<speak>", "</speak>"):
                         for k in range(len(tag) - 1, 0, -1):
@@ -319,10 +330,17 @@ class ConnectionHandler:
                         display, disp_buf = disp_buf[:-hold], disp_buf[-hold:]
                     else:
                         display, disp_buf = disp_buf, ""
-                    rt.disp_buf = disp_buf
+                    disp_hold = disp_buf
                     if display:
-                        rt.display_accum += display
-                        await self.pool.flush_delta(rt)
+                        if cur_text_ev is None:
+                            cur_text_ev = await self.pool.emit(
+                                rt, "assistant_text", text=display
+                            )
+                        else:
+                            cur_text_ev["text"] += display
+                            await self.pool.send_text_delta(
+                                rt, cur_text_ev["seq"], display
+                            )
 
                     if self.tts:
                         tts_buffer += delta
@@ -381,19 +399,24 @@ class ConnectionHandler:
                             break
 
                 elif etype == "tool_use":
-                    await self.pool.send(rt, ToolUse(
-                        tool_name=event["tool_name"],
+                    # A tool call ends the current text block; the next text
+                    # opens a fresh bubble.
+                    cur_text_ev = None
+                    await self.pool.emit(
+                        rt, "tool_use",
                         tool_id=event["tool_id"],
+                        tool_name=event["tool_name"],
                         input=event.get("input", {}) or {},
-                    ))
+                    )
 
                 elif etype == "tool_result":
-                    await self.pool.send(rt, ToolResult(
+                    await self.pool.emit(
+                        rt, "tool_result",
                         tool_id=event["tool_id"],
                         tool_name=event.get("tool_name", ""),
                         success=event["success"],
                         output=(event.get("output") or "")[:2000],
-                    ))
+                    )
 
                 elif etype == "response_complete":
                     self._persist_session_id(rt)
@@ -402,9 +425,8 @@ class ConnectionHandler:
             log.info("Turn cancelled for workspace %s", rt.name)
         except Exception as e:
             log.exception("Turn error for workspace %s", rt.name)
-            await self.pool.send(rt, Error(message=str(e), code="agent_error"))
+            await self.send_json(Error(message=str(e), code="agent_error", workspace=rt.name))
         finally:
-            await self.pool.send(rt, ResponseEnd())
             if tts_task:
                 await tts_queue.put(None)
                 try:
@@ -413,7 +435,9 @@ class ConnectionHandler:
                     pass
             rt.tts_queue = None
             rt.is_responding = False
-            rt.disp_buf = ""
+            # Closing turn_state — appended last so the phone derives "not
+            # responding" (and stops the streaming cursor) from the log tail.
+            await self.pool.emit(rt, "turn_state", responding=False)
             # Remember this turn's spoken text for on-demand replay (keep the prior
             # one if this turn produced no speech, e.g. a tool-only turn).
             joined = " ".join(turn_spoken).strip()
@@ -441,7 +465,10 @@ class ConnectionHandler:
                 if rt.interrupted or not self.pool.is_active(rt):
                     continue
                 if not started:
-                    await self.pool.send(rt, TTSStart())
+                    # Highlight the assistant bubble currently being read.
+                    await self.send_json(TTSStart(
+                        target_seq=self._last_assistant_seq(rt), workspace=rt.name,
+                    ))
                     started = True
                 try:
                     async for chunk in self.tts.synthesize(text):
@@ -452,9 +479,18 @@ class ConnectionHandler:
                     log.exception("TTS error")
                     break
             if started and self.pool.is_active(rt):
-                await self.pool.send(rt, TTSEnd())
+                await self.send_json(TTSEnd(workspace=rt.name))
         except (WebSocketDisconnect, RuntimeError):
             log.debug("TTS consumer: client disconnected")
+
+    @staticmethod
+    def _last_assistant_seq(rt: WorkspaceRuntime) -> int:
+        """seq of the most recent assistant_text event (the bubble being read),
+        or -1 if none — so the phone can highlight the right message."""
+        for ev in reversed(rt.event_log):
+            if ev.get("kind") == "assistant_text":
+                return ev["seq"]
+        return -1
 
     async def _interrupt_active(self) -> None:
         self._cancel_replay()
@@ -490,26 +526,27 @@ class ConnectionHandler:
     async def _request_permission(self, name: str, tool_name: str, tool_input: dict) -> bool:
         """Hook callback: ask the phone for yes/no on a gated tool.
 
-        If the workspace is backgrounded, the request waits silently and is
-        surfaced to the phone when the user switches to it.
+        The request is appended to the workspace's event log (a permission_req
+        event) so it surfaces on that project's page wherever the phone is —
+        switching to it replays the still-open request from the log. The matching
+        permission_res event (on approve/deny/timeout) dismisses it.
         """
         rt = self.pool.runtimes.get(name)
         if rt is None:
             return False
         pid = uuid.uuid4().hex[:12]
-        summary, detail, spoken = _describe_tool(tool_name, tool_input)
+        summary, detail, _spoken = _describe_tool(tool_name, tool_input)
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         rt.pending_approvals[pid] = fut
-        rt.approval_meta[pid] = {
-            "tool_name": tool_name, "summary": summary, "detail": detail, "spoken": spoken,
-        }
-        # This workspace is now blocked on the user — reflect it on the dashboard
-        # even if it's a background session the phone isn't watching.
+        # Log the request — streams to the phone (which buzzes; no spoken prompt).
+        await self.pool.emit(
+            rt, "permission_req",
+            id=pid, tool_name=tool_name, summary=summary, detail=detail,
+        )
+        rt.approval_timers[pid] = asyncio.create_task(self._approval_timeout(rt, pid))
+        # This workspace is now blocked on the user — reflect it on the dashboard.
         await self.pool.broadcast_status()
-
-        if self.pool.is_active(rt):
-            await self._surface_approval(rt, pid)
 
         approved = False
         try:
@@ -517,34 +554,12 @@ class ConnectionHandler:
             return approved
         finally:
             rt.pending_approvals.pop(pid, None)
-            rt.approval_meta.pop(pid, None)
             timer = rt.approval_timers.pop(pid, None)
             if timer is not None:
                 timer.cancel()
-            was_surfaced = pid in rt.surfaced
-            rt.surfaced.discard(pid)
-            # Tell the phone it's settled, however it was answered (only if it
-            # was ever shown there).
-            if was_surfaced:
-                await self.pool.send(rt, PermissionResolved(id=pid, approved=approved))
-            # No longer blocked — refresh the dashboard.
+            # Settle it in the log, however it was answered — dismisses the phone.
+            await self.pool.emit(rt, "permission_res", id=pid, approved=approved)
             await self.pool.broadcast_status()
-
-    async def _surface_approval(self, rt: WorkspaceRuntime, pid: str) -> None:
-        """Show a pending approval on the phone and start its auto-deny timer.
-        Only meaningful while ``rt`` is the on-screen workspace."""
-        if pid in rt.surfaced or not self.pool.is_active(rt):
-            return
-        meta = rt.approval_meta.get(pid)
-        if not meta:
-            return
-        rt.surfaced.add(pid)
-        await self.pool.send(rt, PermissionRequest(
-            id=pid, tool_name=meta["tool_name"],
-            summary=meta["summary"], detail=meta["detail"],
-        ))
-        # No spoken prompt — the phone buzzes instead (quieter in a pocket).
-        rt.approval_timers[pid] = asyncio.create_task(self._approval_timeout(rt, pid))
 
     async def _approval_timeout(self, rt: WorkspaceRuntime, pid: str) -> None:
         await asyncio.sleep(self.approval_timeout)
@@ -578,7 +593,7 @@ class ConnectionHandler:
 
     # ----------------------------------------------------------- workspaces
 
-    async def _handle_select_workspace(self, name: str) -> None:
+    async def _handle_select_workspace(self, name: str, since: int = -1) -> None:
         ws_config = self.workspaces.get(name)
         if ws_config is None:
             await self.send_json(Error(
@@ -587,10 +602,11 @@ class ConnectionHandler:
             return
 
         # Already live (including surviving a previous connection)? Just bring it
-        # to the foreground and repaint — never interrupt it.
+        # to the foreground and catch the phone up from its cursor — never
+        # interrupt it.
         existing = self.pool.runtimes.get(name)
         if existing is not None:
-            await self._activate_and_repaint(existing)
+            await self._activate(existing, since)
             return
 
         # First time on this connection: spin up a fresh agent for it.
@@ -628,9 +644,18 @@ class ConnectionHandler:
                 return
 
         rt = WorkspaceRuntime(name=name, path=ws_config.path, agent=agent)
+        # Seed the event log from the resumed transcript (off the event loop —
+        # parsing a long JSONL shouldn't stall other workspaces' streams) so the
+        # phone gets scrollback on open.
+        if rt.agent.session_id:
+            try:
+                history = await asyncio.to_thread(load_history, rt.agent.session_id)
+                rt.seed_events(history)
+            except Exception:
+                log.exception("Failed to seed history for %s", rt.agent.session_id)
         self.pool.runtimes[name] = rt
         log.info("Session %s → workspace %s (%s)", self.session.session_id, name, ws_config.path)
-        await self._activate_and_repaint(rt)
+        await self._activate(rt, since)
         # A new live session exists now — update the dashboard.
         await self.pool.broadcast_status()
 
@@ -651,45 +676,18 @@ class ConnectionHandler:
         log.info("Closed workspace %s (transcript kept for resume)", name)
         await self.pool.broadcast_status()
 
-    async def _activate_and_repaint(self, rt: WorkspaceRuntime) -> None:
-        """Bring ``rt`` on-screen: mark it active and replay scrollback + any
-        in-flight progress, atomically so a concurrent live turn can't interleave.
+    async def _activate(self, rt: WorkspaceRuntime, since: int) -> None:
+        """Bring ``rt`` on-screen (it now routes TTS audio) and catch the phone's
+        event-log cursor up from ``since``.
 
-        The whole thing runs under the pool's send lock: any in-flight turn for
-        ``rt`` blocks on the lock before it can send, so its first live delta
-        lands strictly after this repaint (and only the not-yet-sent suffix, via
-        the shared ``sent_len`` cursor). This is also the reconnect path — the
-        runtime may have been running the whole time the app was closed."""
-        async with self.pool.lock:
-            self.pool.active_name = rt.name
-            await self.send_json(WorkspaceSelected(
-                name=rt.name, path=rt.path, responding=rt.is_responding,
-            ))
-
-            # Persisted prior turns from the SDK transcript.
-            if rt.agent.session_id:
-                try:
-                    history = load_history(rt.agent.session_id)
-                except Exception:
-                    log.exception("Failed to load history for %s", rt.agent.session_id)
-                    history = []
-                if history:
-                    await self.send_json(ConversationHistory(
-                        messages=[HistoryMessage(**m) for m in history],
-                        workspace=rt.name,
-                    ))
-
-            # The phone cleared this page before switching, so resend the current
-            # turn's progress-so-far from the top and reset the cursor.
-            rt.sent_len = 0
-            if rt.is_responding and rt.display_accum:
-                await self.send_json(ResponseDelta(text=rt.display_accum, workspace=rt.name))
-                rt.sent_len = len(rt.display_accum)
-
-        # Surface any approval that's been waiting in the background (its own
-        # sends don't need the stream lock).
-        for pid in list(rt.pending_approvals.keys()):
-            await self._surface_approval(rt, pid)
+        No lock, no disk I/O, no repaint bookkeeping: scrollback, in-flight turn
+        progress, and any open approval all live in the event log, so a single
+        `sync` from the phone's cursor delivers exactly what it's missing. This
+        is also the reconnect path — the runtime may have been running the whole
+        time the app was closed; its events are all in the log."""
+        self.pool.active_name = rt.name
+        await self.send_json(WorkspaceSelected(name=rt.name, path=rt.path))
+        await self.pool.send_sync(rt, since)
 
     # ---------------------------------------------------------------- audio
 
@@ -710,7 +708,7 @@ class ConnectionHandler:
             return
         if not text or not text.strip():
             return
-        await self.send_json(Transcription(text=text))
+        # The recognized text becomes a user_msg event inside _handle_user_input.
         await self._handle_user_input(text)
 
     def _cancel_replay(self) -> None:
@@ -731,12 +729,16 @@ class ConnectionHandler:
 
     async def _stream_replay(self, rt: WorkspaceRuntime, text: str) -> None:
         try:
-            await self.pool.send(rt, TTSStart())
+            if self.pool.is_active(rt):
+                await self.send_json(TTSStart(
+                    target_seq=self._last_assistant_seq(rt), workspace=rt.name,
+                ))
             async for chunk in self.tts.synthesize(text):
                 if not self.pool.is_active(rt):  # user swiped away — stop
                     break
                 await self.pool.send_audio(rt, chunk)
-            await self.pool.send(rt, TTSEnd())
+            if self.pool.is_active(rt):
+                await self.send_json(TTSEnd(workspace=rt.name))
         except asyncio.CancelledError:
             pass
         except Exception:
